@@ -1,9 +1,12 @@
 """Unit tests of what is only Python's: how a handler is found, and which values are a response. The HTTP and cron
 behaviour is in tests/contract/contract_test.py, which runs the same cases against every runtime."""
+import errno
 import os
+import socket
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adapter  # noqa: E402
@@ -18,7 +21,8 @@ class LoadHandler(unittest.TestCase):
     def write(self, rel, text):
         full = os.path.join(self.dir.name, rel)
         os.makedirs(os.path.dirname(full), exist_ok=True)
-        open(full, "w").write(text)
+        with open(full, "w") as f:
+            f.write(text)
 
     def test_a_module_in_the_code_dir(self):
         self.write("mod_a.py", "def handler(e, c):\n    return 'a'\n")
@@ -49,16 +53,59 @@ class ToResponse(unittest.TestCase):
 
     def test_bad_values(self):
         for bad in (None, 5, [], b"bytes", {}, {"statusCode": "200"}, {"statusCode": 200.0}, {"statusCode": True},
-                    {"statusCode": 99}, {"statusCode": 600}, {"statusCode": 200, "headers": []},
+                    {"statusCode": 99}, {"statusCode": 100}, {"statusCode": 199}, {"statusCode": 600},
+                    {"statusCode": 200, "headers": {"a": "é"}}, {"statusCode": 200, "headers": {"a": "\x01"}},
+                    {"statusCode": 200, "isBase64Encoded": True, "body": "QU\nJD"}, {"statusCode": 200, "headers": []},
                     {"statusCode": 200, "headers": {"a": 1}}, {"statusCode": 200, "headers": {"a b": "x"}},
                     {"statusCode": 200, "headers": {"a": "x\ny"}}, {"statusCode": 200, "body": b"bytes"},
                     {"statusCode": 200, "isBase64Encoded": True, "body": "***"}):
             with self.assertRaises(adapter.InvalidResponse, msg=repr(bad)):
                 adapter.to_response(bad)
 
+    def test_a_coroutine_is_refused_and_closed(self):
+        async def handler():
+            return "x"
+
+        coroutine = handler()
+        with self.assertRaises(adapter.InvalidResponse):
+            adapter.to_response(coroutine)
+        self.assertIsNone(coroutine.cr_frame, "the coroutine was closed, so it does not warn that it was never awaited")
+
+    def test_one_header_per_name_the_last_wins(self):
+        _, headers, _ = adapter.to_response({"statusCode": 200, "headers": {"X-A": "1", "x-a": "2", "Server": "mine"}})
+        self.assertEqual(headers, [("x-a", "2")])
+
     def test_base64_only_when_the_flag_is_exactly_true(self):
         self.assertEqual(adapter.to_response({"statusCode": 200, "isBase64Encoded": True, "body": "AP8="})[2], b"\x00\xff")
         self.assertEqual(adapter.to_response({"statusCode": 200, "isBase64Encoded": "yes", "body": "AP8="})[2], b"AP8=")
+
+
+class SplitTarget(unittest.TestCase):
+    def test_targets(self):
+        for target, want in {"/a/b?x=1": ("/a/b", "x=1"), "//x/y?q=1": ("/x/y", "q=1"), "http://h/abs": ("/abs", ""),
+                             "http://h": ("/", ""), "//": ("/", ""), "/a%2Fb/../c?": ("/a%2Fb/../c", "")}.items():
+            self.assertEqual(adapter.split_target(target), want, target)
+
+
+class Listening(unittest.TestCase):
+    def test_a_kernel_without_ipv6_gets_an_ipv4_socket(self):
+        real = socket.socket
+
+        def no_ipv6(family=-1, *args, **kwargs):
+            if family == socket.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "no IPv6")
+            return real(family, *args, **kwargs)
+
+        with mock.patch("socketserver.socket.socket", side_effect=no_ipv6):
+            server = adapter.Server(0, lambda e, c: "x")
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.socket.family, socket.AF_INET)
+
+    def test_with_ipv6_one_socket_takes_both_families(self):
+        server = adapter.Server(0, lambda e, c: "x")
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.socket.family, socket.AF_INET6)
+        self.assertEqual(server.socket.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY), 0)
 
 
 class Context(unittest.TestCase):

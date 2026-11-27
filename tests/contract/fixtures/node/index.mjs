@@ -16,6 +16,8 @@ const INVALID = [
   { statusCode: 200, body: 5 },
   { statusCode: 200, isBase64Encoded: true, body: 'not base64!' },
   { statusCode: true },
+  { statusCode: 100 },
+  { statusCode: 199 },
 ];
 
 export async function handler(event, context) {
@@ -47,6 +49,15 @@ export async function handler(event, context) {
       return { statusCode: 200, headers: { 'Content-Length': '1', Connection: 'close', 'X-Ok': '1' }, body: 'hello' };
     case '/b64':
       return { statusCode: 200, isBase64Encoded: true, body: Buffer.from([0, 255, 65, 66]).toString('base64') };
+    case '/dangling':
+      Promise.reject(new Error('dangling'));
+      return 'ok';
+    case '/nonascii':
+      return { statusCode: 200, headers: { 'x-a': 'é€' }, body: 'x' };
+    case '/b64nl':
+      return { statusCode: 200, isBase64Encoded: true, body: 'QU\nJD' };
+    case '/date':
+      return { statusCode: 200, headers: { Date: 'Thu, 01 Jan 1970 00:00:00 GMT' }, body: 'x' };
     case '/badhead':
       return { statusCode: 200, headers: { 'bad name': 'x' }, body: 'x' };
     case '/len':
@@ -61,6 +72,6 @@ export async function handler(event, context) {
       return json([first, context.getRemainingTimeInMillis()]);
     }
     default:
-      return { statusCode: 404, body: 'no such fixture route' };
+      return { statusCode: 404, body: 'path=' + path };
   }
 }

@@ -25,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 FIXTURES = os.path.join(HERE, "fixtures")
 MAX_BODY = 6 * 1024 * 1024
-INVALID_RETURNS = 11  # entries of INVALID in fixtures/python/main.py and fixtures/node/index.mjs
+INVALID_RETURNS = 13  # entries of INVALID in fixtures/python/main.py and fixtures/node/index.mjs
 
 
 class Process:
@@ -142,18 +142,21 @@ class Contract:
         p.wait_port()
         return p
 
-    # --- AC-1, AC-2: what the function returns -------------------------------------------------------------
+    # --- what the function returns -------------------------------------------------------------
 
     def test_status_headers_body_come_back_as_returned(self):
         p = self.serve()
         r = request(p.port, "GET", "/status?code=201")
         self.assertEqual((r.status, r.headers.get("x-a"), r.body), (201, "b", b"ok"))
+        self.assertNotIn("content-type", r.headers, "a response without a content type is sent without one, in every runtime")
 
     def test_204_and_304_carry_no_body_and_head_none(self):
         p = self.serve()
         for code in (204, 304):
             r = request(p.port, "GET", f"/status?code={code}")
             self.assertEqual((r.status, r.body), (code, b""))
+            if code == 204:
+                self.assertNotIn("content-length", r.headers)
         r = request(p.port, "HEAD", "/status?code=200")
         self.assertEqual((r.status, r.body), (200, b""))
 
@@ -177,18 +180,32 @@ class Contract:
 
     def test_invalid_returns_are_500_and_the_adapter_lives_on(self):
         p = self.serve()
-        for n in range(INVALID_RETURNS if self.dynamic else 1):
+        for n in range(INVALID_RETURNS if self.dynamic else 2):
             r = request(p.port, "GET", f"/bad?n={n}")
             self.assertEqual(r.status, 500, f"case {n}: {r.body!r}")
             self.assertNotIn(b"x-evil", r.body)
         self.assertEqual(request(p.port, "GET", "/string").body, b"hello")
 
-    def test_a_header_with_crlf_or_a_bad_name_is_a_500_not_a_split_response(self):
+    def test_a_header_that_is_not_visible_ascii_or_has_a_bad_name_is_a_500_not_a_split_response(self):
         p = self.serve()
-        for path in ("/crlf", "/badhead"):
+        for path in ("/crlf", "/badhead", "/nonascii"):
             r = request(p.port, "GET", path)
             self.assertEqual(r.status, 500, path)
             self.assertNotIn("x-evil", r.headers)
+
+    def test_base64_with_a_line_break_is_a_500(self):
+        p = self.serve()
+        self.assertEqual(request(p.port, "GET", "/b64nl").status, 500)
+
+    def test_a_date_set_by_the_function_is_sent_once(self):
+        p = self.serve()
+        conn = http.client.HTTPConnection("127.0.0.1", p.port, timeout=10)
+        conn.request("GET", "/date")
+        r = conn.getresponse()
+        dates = [v for k, v in r.getheaders() if k.lower() == "date"]
+        r.read()
+        conn.close()
+        self.assertEqual(dates, ["Thu, 01 Jan 1970 00:00:00 GMT"])
 
     def test_the_adapter_owns_the_framing_headers(self):
         p = self.serve()
@@ -197,7 +214,7 @@ class Contract:
         self.assertEqual(r.headers["content-length"], "5")
         self.assertNotEqual(r.headers.get("connection"), "close", "a customer cannot close the connection for the adapter")
 
-    # --- AC-3: the event --------------------------------------------------------------------------------
+    # --- the event --------------------------------------------------------------------------------
 
     def test_the_event_carries_method_path_query_headers_and_body(self):
         p = self.serve()
@@ -220,6 +237,37 @@ class Contract:
         self.assertEqual(got["path"], "/echo")
         self.assertEqual(got["query"], {"x": "A/../"})
 
+    def test_the_target_is_reduced_to_its_path(self):
+        p = self.serve()
+        for target, want in (("//x/y?q=1", "/x/y"), ("http://h/abs?q=1", "/abs"), ("//", "/"), ("/a%2Fb/../c", "/a%2Fb/../c")):
+            s = socket.create_connection(("127.0.0.1", p.port), timeout=10)
+            s.sendall(f"GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".encode())
+            raw = b""
+            while chunk := s.recv(4096):
+                raw += chunk
+            s.close()
+            self.assertTrue(raw.startswith(b"HTTP/1.1 404"), (target, raw))
+            self.assertTrue(raw.endswith(("path=" + want).encode()), (target, raw))
+        self.assertEqual(request(p.port, "GET", "/string").status, 200, "the adapter must survive any target")
+
+    def test_a_target_that_does_not_parse_is_answered_not_dropped(self):
+        p = self.serve()
+        s = socket.create_connection(("127.0.0.1", p.port), timeout=10)
+        s.sendall(b"GET http://[ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        self.assertRegex(s.recv(4096), rb"^HTTP/1\.1 4\d\d ")
+        s.close()
+        self.assertEqual(request(p.port, "GET", "/string").status, 200)
+
+    def test_the_query_keeps_odd_names_and_odd_escapes(self):
+        p = self.serve()
+        got = request(p.port, "GET", "/echo?constructor=1&toString=2&__proto__=3&a=1;b=2&c=%zz&d=a+b").json()["event"]["query"]
+        self.assertEqual(got, {"constructor": "1", "toString": "2", "__proto__": "3", "a": "1;b=2", "c": "%zz", "d": "a b"})
+
+    def test_a_utf8_body_keeps_its_byte_order_mark(self):
+        p = self.serve()
+        got = request(p.port, "POST", "/echo", body=b"\xef\xbb\xbfhi").json()["event"]
+        self.assertEqual((got["body"], got["isBase64Encoded"]), ("\ufeffhi", False))
+
     def test_a_body_that_is_not_utf8_is_base64(self):
         p = self.serve()
         got = request(p.port, "POST", "/echo", body=b"\xff\xfe").json()["event"]
@@ -235,6 +283,17 @@ class Contract:
         p = self.serve()
         r = request(p.port, "POST", "/len", body=b"a" * MAX_BODY, timeout=30)
         self.assertEqual((r.status, r.body), (200, str(MAX_BODY).encode()))
+
+    def test_an_idle_keep_alive_connection_stays_open_for_the_peer_to_close(self):
+        # queue-proxy reuses connections: one the adapter closed on its own after a few seconds is the classic sporadic 502
+        p = self.serve()
+        conn = http.client.HTTPConnection("127.0.0.1", p.port, timeout=15)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/string")
+        conn.getresponse().read()
+        time.sleep(6.5)
+        conn.request("GET", "/string")
+        self.assertEqual(conn.getresponse().read(), b"hello")
 
     def test_a_declared_length_over_the_cap_is_413_without_calling_the_function(self):
         p = self.serve()
@@ -255,7 +314,9 @@ class Contract:
 
     def test_a_malformed_request_is_400_and_the_adapter_lives_on(self):
         p = self.serve()
-        for head in ("Content-Length: abc", "Content-Length: -5", "Transfer-Encoding: chunked\r\n\r\nzz\r\nab"):
+        for head in ("Content-Length: abc", "Content-Length: -5", "Content-Length: \u00b2",
+                     "Transfer-Encoding: chunked\r\n\r\nzz\r\nab", "Transfer-Encoding: chunked\r\n\r\n-1\r\nab\r\n0\r\n\r\n",
+                     "Transfer-Encoding: chunked\r\n\r\n0x5\r\nhello\r\n0\r\n\r\n", "Transfer-Encoding: chunked\r\n\r\n1_0\r\nabcdefghijklmnop\r\n0\r\n\r\n"):
             s = socket.create_connection(("127.0.0.1", p.port), timeout=10)
             s.sendall(f"POST /len HTTP/1.1\r\nHost: x\r\n{head}\r\n\r\n".encode() if "\r\n\r\n" not in head else
                       f"POST /len HTTP/1.1\r\nHost: x\r\n{head}".encode())
@@ -273,7 +334,7 @@ class Contract:
         self.assertIsNone(p.proc.poll(), "the adapter must still run")
         self.assertNotIn("LEN-CALLED", p.stdout(), "the function must not see a body that never arrived")
 
-    # --- AC-4: the context ----------------------------------------------------------------------------
+    # --- the context ----------------------------------------------------------------------------
 
     def test_the_context_carries_the_ids_and_the_time_left(self):
         p = self.serve(TITAN_FUNCTION_ID="f-1", TITAN_VERSION_ID="v-1", TITAN_TIMEOUT_SECONDS="10")
@@ -289,13 +350,20 @@ class Contract:
         self.assertNotEqual(a["requestId"], b["requestId"])
         self.assertIsNone(a["remainingMs"], "without TITAN_TIMEOUT_SECONDS there is no deadline to report")
 
+    def test_a_timeout_that_is_not_a_positive_number_means_no_deadline(self):
+        for value in ("0", "-5", "abc", "inf", "nan", ""):
+            p = self.serve(TITAN_TIMEOUT_SECONDS=value)
+            self.assertIsNone(request(p.port, "GET", "/echo").json()["context"]["remainingMs"], value)
+            p.proc.send_signal(signal.SIGTERM)
+            p.wait(5)
+
     def test_the_time_left_runs_down_while_the_function_runs(self):
         p = self.serve(TITAN_TIMEOUT_SECONDS="10")
         first, second = request(p.port, "GET", "/remaining").json()
         self.assertTrue(first - second >= 250, (first, second))
         self.assertTrue(first <= 10000)
 
-    # --- AC-5: cron ----------------------------------------------------------------------------------
+    # --- cron ----------------------------------------------------------------------------------
 
     def cron(self, **env):
         return self.start(TITAN_TRIGGER="cron", **env)
@@ -311,6 +379,10 @@ class Contract:
         self.assertEqual(sorted(event), ["schedule", "scheduledTime", "trigger"])
         self.assertFalse(p.listening(), "a cron run opens no port")
 
+    def test_cron_does_not_read_the_port(self):
+        p = self.cron(PORT="abc")
+        self.assertEqual(p.wait(15), 0, p.stderr())
+
     def test_cron_without_a_scheduled_time_uses_the_start_minute_in_utc(self):
         before = time.strftime("%Y-%m-%dT%H:%M:00Z", time.gmtime())
         p = self.cron(TITAN_SCHEDULE="* * * * *")
@@ -324,7 +396,7 @@ class Contract:
         self.assertEqual(p.wait(15), 1)
         self.assertIn("cron-boom", p.stderr())
 
-    # --- AC-6: SIGTERM ---------------------------------------------------------------------------------
+    # --- SIGTERM ---------------------------------------------------------------------------------
 
     def test_sigterm_when_idle_exits_0_at_once(self):
         p = self.serve()
@@ -370,7 +442,7 @@ class Contract:
         self.assertEqual(p.wait(6), 143, p.stderr())
         self.assertLess(time.time() - t0, 1.0)
 
-    # --- AC-7: a function that does not load ----------------------------------------------------------
+    # --- a function that does not load ----------------------------------------------------------
 
     def assert_does_not_start(self, **env):
         p = self.start(TITAN_TRIGGER="http", **env)
@@ -380,6 +452,15 @@ class Contract:
 
     def test_a_port_that_is_not_a_number_does_not_start(self):
         self.assert_does_not_start(PORT="abc")
+
+    def test_a_port_that_is_not_plain_digits_does_not_start(self):
+        for port in (" 80", "+80", "8 0", "99999", "-1"):
+            self.assert_does_not_start(PORT=port)
+
+    def test_an_empty_trigger_is_http(self):
+        p = self.start(TITAN_TRIGGER="")
+        p.wait_port()
+        self.assertEqual(request(p.port, "GET", "/string").body, b"hello")
 
 
 class DynamicLoadContract(Contract):
@@ -423,12 +504,24 @@ def _wait_for(read, needle, timeout=5):
 class PythonContract(DynamicLoadContract, unittest.TestCase):
     runtime = "python"
 
+    def test_sys_exit_in_a_handler_is_a_500_and_the_adapter_lives_on(self):
+        p = self.serve()
+        self.assertEqual(request(p.port, "GET", "/exit").status, 500)
+        self.assertEqual(request(p.port, "GET", "/string").status, 200)
+
     def argv(self):
         return [sys.executable, os.path.join(ROOT, "python", "adapter.py")]
 
 
 class NodeContract(DynamicLoadContract, unittest.TestCase):
     runtime = "node"
+
+    def test_a_promise_left_unhandled_does_not_end_the_adapter(self):
+        p = self.serve()
+        self.assertEqual(request(p.port, "GET", "/dangling").body, b"ok")
+        time.sleep(0.3)
+        self.assertEqual(request(p.port, "GET", "/string").status, 200)
+        self.assertIn("dangling", p.stderr())
 
     def argv(self):
         return ["node", os.path.join(ROOT, "node", "adapter.mjs")]

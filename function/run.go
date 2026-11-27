@@ -7,11 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -39,22 +43,22 @@ func configFrom(getenv func(string) string, now time.Time) (config, error) {
 		port: getenv("PORT"), trigger: getenv("TITAN_TRIGGER"), functionID: getenv("TITAN_FUNCTION_ID"),
 		versionID: getenv("TITAN_VERSION_ID"), schedule: getenv("TITAN_SCHEDULE"), scheduledTime: getenv("TITAN_SCHEDULED_TIME"),
 	}
-	if c.port == "" {
-		c.port = "8080"
-	}
-	if n, err := strconv.Atoi(c.port); err != nil || n < 0 || n > 65535 {
-		return c, fmt.Errorf("PORT %q is not a number", c.port)
-	}
 	if c.trigger == "" {
 		c.trigger = "http"
 	}
 	if c.trigger != "http" && c.trigger != "cron" {
 		return c, fmt.Errorf("TITAN_TRIGGER %q is neither http nor cron", c.trigger)
 	}
-	if raw := getenv("TITAN_TIMEOUT_SECONDS"); raw != "" {
-		if s, err := strconv.ParseFloat(raw, 64); err == nil && s > 0 {
-			c.timeout = time.Duration(s * float64(time.Second))
-		}
+	if c.port == "" {
+		c.port = "8080"
+	}
+	// a cron run opens no port, so it does not read PORT; plain digits only (not " 80", not "+80")
+	if n, err := strconv.Atoi(c.port); c.trigger == "http" && (err != nil || strings.Trim(c.port, "0123456789") != "" || n > 65535) {
+		return c, fmt.Errorf("PORT %q is not a number", c.port)
+	}
+	// anything but a positive finite number of seconds means no deadline
+	if s, err := strconv.ParseFloat(getenv("TITAN_TIMEOUT_SECONDS"), 64); err == nil && s > 0 && !math.IsInf(s, 0) && !math.IsNaN(s) {
+		c.timeout = time.Duration(s * float64(time.Second))
 	}
 	if c.scheduledTime == "" {
 		c.scheduledTime = now.UTC().Truncate(time.Minute).Format("2006-01-02T15:04:05Z")
@@ -142,17 +146,14 @@ func (a *adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Host != "" {
 		headers["host"] = r.Host
 	}
-	query := map[string]string{}
-	for key, values := range r.URL.Query() {
-		query[key] = strings.Join(values, ",")
+	if len(r.TransferEncoding) > 0 {
+		headers["transfer-encoding"] = strings.Join(r.TransferEncoding, ", ") // Go moves it out of r.Header; the other runtimes pass it
 	}
+	path, rawQuery := splitTarget(r.RequestURI)
+	query := parseQuery(rawQuery)
 	text, isB64 := string(body), false
 	if !utf8.Valid(body) {
 		text, isB64 = base64.StdEncoding.EncodeToString(body), true
-	}
-	path := r.RequestURI
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
 	}
 	requestID := r.Header.Get("X-Request-Id")
 	if requestID == "" {
@@ -175,16 +176,65 @@ func (a *adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func write(w http.ResponseWriter, r *http.Request, resp Response, payload []byte) {
 	h := w.Header()
-	for name, value := range resp.Headers {
+	names := make([]string, 0, len(resp.Headers))
+	for name := range resp.Headers {
+		names = append(names, name)
+	}
+	sort.Strings(names) // one header per name, however it is cased: the last in byte order wins
+	for _, name := range names {
 		if !framing(name) {
-			h.Set(name, value)
+			h.Del(name)
+			h.Set(name, resp.Headers[name])
 		}
 	}
-	h.Set("Content-Length", strconv.Itoa(len(payload)))
+	if h.Get("Content-Type") == "" {
+		h["Content-Type"] = nil // net/http would sniff one from the body: the other runtimes send none
+	}
+	if resp.StatusCode != 204 { // RFC 9110: a 204 has no Content-Length
+		h.Set("Content-Length", strconv.Itoa(len(payload)))
+	}
 	w.WriteHeader(resp.StatusCode)
 	if r.Method != http.MethodHead && resp.StatusCode != 204 && resp.StatusCode != 304 {
 		w.Write(payload)
 	}
+}
+
+var targetRE = regexp.MustCompile(`^(?:[A-Za-z][A-Za-z0-9+.-]*://[^/?]*)?([^?]*)(?:\?(.*))?$`)
+
+// splitTarget returns the path and the raw query of a request target: an absolute-form target loses its scheme and host,
+// a leading run of slashes is one.
+func splitTarget(target string) (string, string) {
+	m := targetRE.FindStringSubmatch(target)
+	if m == nil {
+		return "/", ""
+	}
+	return "/" + strings.TrimLeft(m[1], "/"), m[2]
+}
+
+// parseQuery reads a raw query the way the Python and Node.js adapters do: pairs split on "&" only, a name or value that is
+// not a valid escape stays as written, repeated names are joined with ",". (r.URL.Query drops such pairs.)
+func parseQuery(raw string) map[string]string {
+	query := map[string]string{}
+	if raw == "" {
+		return query
+	}
+	for _, pair := range strings.Split(raw, "&") {
+		if pair == "" {
+			continue
+		}
+		name, value, _ := strings.Cut(pair, "=")
+		if n, err := url.QueryUnescape(name); err == nil {
+			name = n
+		}
+		if v, err := url.QueryUnescape(value); err == nil {
+			value = v
+		}
+		if old, ok := query[name]; ok {
+			value = old + "," + value
+		}
+		query[name] = value
+	}
+	return query
 }
 
 // readBody reads the request body up to the cap; over it, it answers 413 and reports false.
@@ -236,18 +286,23 @@ const tokenChars = "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHI
 
 // check validates a response and returns the bytes of its body.
 func check(resp *Response) ([]byte, error) {
-	if resp.StatusCode < 100 || resp.StatusCode > 599 {
-		return nil, fmt.Errorf("statusCode %d is not from 100 to 599", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode > 599 {
+		return nil, fmt.Errorf("statusCode %d is not from 200 to 599", resp.StatusCode)
 	}
 	for name, value := range resp.Headers {
 		if name == "" || strings.Trim(name, tokenChars) != "" {
 			return nil, fmt.Errorf("header name %q is not valid", name)
 		}
-		if strings.ContainsAny(value, "\r\n\x00") {
-			return nil, fmt.Errorf("header %s: the value has a line break", name)
+		for _, c := range []byte(value) {
+			if c != '\t' && (c < 0x20 || c > 0x7e) {
+				return nil, fmt.Errorf("header %s: the value is not visible ASCII", name)
+			}
 		}
 	}
 	if resp.IsBase64Encoded {
+		if strings.ContainsAny(resp.Body, "\r\n") { // the decoder would skip them
+			return nil, errors.New("body is not valid base64")
+		}
 		b, err := base64.StdEncoding.Strict().DecodeString(resp.Body)
 		if err != nil {
 			return nil, errors.New("body is not valid base64")

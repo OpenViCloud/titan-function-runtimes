@@ -21,19 +21,24 @@ func TestConfigFrom(t *testing.T) {
 	if err != nil || c.port != "9000" || c.trigger != "cron" || c.timeout != 2500*time.Millisecond || c.scheduledTime != "2026-01-01T00:00:00Z" {
 		t.Fatalf("set: %+v %v", c, err)
 	}
-	for _, bad := range []map[string]string{{"PORT": "abc"}, {"PORT": "70000"}, {"PORT": "-1"}, {"TITAN_TRIGGER": "queue"}} {
+	for _, bad := range []map[string]string{{"PORT": "abc"}, {"PORT": "70000"}, {"PORT": "-1"}, {"PORT": "+80"}, {"PORT": " 80"}, {"TITAN_TRIGGER": "queue"}} {
 		if _, err := configFrom(env(bad), now); err == nil {
 			t.Errorf("%v should be refused", bad)
 		}
 	}
-	if c, _ := configFrom(env(map[string]string{"TITAN_TIMEOUT_SECONDS": "x"}), now); c.timeout != 0 {
-		t.Errorf("a timeout that is not a number means no deadline, got %v", c.timeout)
+	for _, v := range []string{"x", "0", "-1", "inf", "nan", ""} {
+		if c, _ := configFrom(env(map[string]string{"TITAN_TIMEOUT_SECONDS": v}), now); c.timeout != 0 {
+			t.Errorf("TITAN_TIMEOUT_SECONDS=%q means no deadline, got %v", v, c.timeout)
+		}
+	}
+	if _, err := configFrom(env(map[string]string{"TITAN_TRIGGER": "cron", "PORT": "abc"}), now); err != nil {
+		t.Errorf("a cron run does not read PORT: %v", err)
 	}
 }
 
 func TestCheck(t *testing.T) {
 	good := []Response{
-		{StatusCode: 200}, {StatusCode: 100}, {StatusCode: 599}, {StatusCode: 200, Headers: map[string]string{"X-A": "b"}},
+		{StatusCode: 200}, {StatusCode: 204}, {StatusCode: 599}, {StatusCode: 200, Headers: map[string]string{"X-A": "b"}},
 		{StatusCode: 200, IsBase64Encoded: true, Body: "AP8="},
 	}
 	for _, r := range good {
@@ -42,9 +47,11 @@ func TestCheck(t *testing.T) {
 		}
 	}
 	bad := []Response{
-		{}, {StatusCode: 99}, {StatusCode: 600}, {StatusCode: 200, Headers: map[string]string{"a b": "x"}},
+		{}, {StatusCode: 99}, {StatusCode: 100}, {StatusCode: 199}, {StatusCode: 600}, {StatusCode: 200, Headers: map[string]string{"a b": "x"}},
 		{StatusCode: 200, Headers: map[string]string{"": "x"}}, {StatusCode: 200, Headers: map[string]string{"a": "x\ny"}},
+		{StatusCode: 200, Headers: map[string]string{"a": "é"}}, {StatusCode: 200, Headers: map[string]string{"a": "\x01"}},
 		{StatusCode: 200, IsBase64Encoded: true, Body: "***"}, {StatusCode: 200, IsBase64Encoded: true, Body: "AP8"},
+		{StatusCode: 200, IsBase64Encoded: true, Body: "QU\nJD"},
 	}
 	for _, r := range bad {
 		if _, err := check(&r); err == nil {
@@ -107,5 +114,29 @@ func TestNewIDIsAUUID(t *testing.T) {
 	a, b := newID(), newID()
 	if !re.MatchString(a) || a == b {
 		t.Errorf("%s %s", a, b)
+	}
+}
+
+func TestSplitTarget(t *testing.T) {
+	for target, want := range map[string][2]string{
+		"/a/b?x=1": {"/a/b", "x=1"}, "//x/y?q=1": {"/x/y", "q=1"}, "http://h/abs": {"/abs", ""}, "http://h": {"/", ""},
+		"//": {"/", ""}, "*": {"/*", ""}, "/a%2Fb/../c?": {"/a%2Fb/../c", ""},
+	} {
+		if p, q := splitTarget(target); [2]string{p, q} != want {
+			t.Errorf("%q: got %q %q, want %q", target, p, q, want)
+		}
+	}
+}
+
+func TestParseQueryKeepsWhatTheOtherRuntimesKeep(t *testing.T) {
+	got := parseQuery("a=1;b=2&c=%zz&d=%41&e=a+b&f&a2=1&a2=2&&=x")
+	want := map[string]string{"a": "1;b=2", "c": "%zz", "d": "A", "e": "a b", "f": "", "a2": "1,2", "": "x"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%q: got %q, want %q", k, got[k], v)
+		}
 	}
 }

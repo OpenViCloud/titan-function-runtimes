@@ -9,8 +9,10 @@ TITAN_VERSION_ID, TITAN_TIMEOUT_SECONDS, TITAN_SCHEDULE, TITAN_SCHEDULED_TIME, T
 import base64
 import http.server
 import importlib
-import json
+import inspect
+import math
 import os
+import re
 import signal
 import socket
 import sys
@@ -22,7 +24,10 @@ import uuid
 
 MAX_BODY = 6 * 1024 * 1024
 SHUTDOWN_WAIT = 2.0
-FRAMING_HEADERS = {"content-length", "transfer-encoding", "connection"}
+FRAMING_HEADERS = {"content-length", "transfer-encoding", "connection", "server"}
+HEADER_VALUE = re.compile(r"[\t\x20-\x7e]*")  # visible ASCII: what every runtime sends as a header value
+CHUNK_SIZE = re.compile(r"[0-9a-fA-F]{1,8}")
+TARGET = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://[^/?]*)?([^?]*)(?:\?(.*))?$", re.S)
 TOKEN_CHARS = frozenset("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
@@ -69,37 +74,49 @@ def _context(headers, timeout):
 
 
 def _timeout():
-    raw = os.environ.get("TITAN_TIMEOUT_SECONDS", "")
+    """TITAN_TIMEOUT_SECONDS as a number of seconds; anything but a positive finite number means no deadline."""
     try:
-        return float(raw) if raw else None
+        seconds = float(os.environ.get("TITAN_TIMEOUT_SECONDS", ""))
     except ValueError:
         return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+
+def split_target(target):
+    """(path, raw query) of a request target: an absolute-form target loses its scheme and host, a leading run of slashes is one."""
+    path, query = TARGET.match(target).groups()
+    return "/" + path.lstrip("/"), query or ""
 
 
 def to_response(result):
     """(status, [(name, value)], body bytes) from what the handler returned; InvalidResponse when it is none of the two shapes."""
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise InvalidResponse("the handler is async: the Python runtime calls a plain function")
     if isinstance(result, str):
         return 200, [("Content-Type", "text/plain; charset=utf-8")], result.encode()
     if not isinstance(result, dict):
         raise InvalidResponse(f"the function returned {type(result).__name__}, not a string or a dict with statusCode")
     status = result.get("statusCode")
-    if type(status) is not int or not 100 <= status <= 599:
-        raise InvalidResponse(f"statusCode {status!r} is not an integer from 100 to 599")
+    if type(status) is not int or not 200 <= status <= 599:
+        raise InvalidResponse(f"statusCode {status!r} is not an integer from 200 to 599")
     headers = result.get("headers", {})
     if headers is None:
         headers = {}
     if not isinstance(headers, dict):
         raise InvalidResponse("headers is not an object")
-    out = []
+    out = {}
     for name, value in headers.items():
         if not isinstance(name, str) or not name or not set(name) <= TOKEN_CHARS:
             raise InvalidResponse(f"header name {name!r} is not valid")
         if not isinstance(value, str):
             raise InvalidResponse(f"header {name}: the value is not a string")
-        if "\r" in value or "\n" in value or "\0" in value:
-            raise InvalidResponse(f"header {name}: the value has a line break")
+        if not HEADER_VALUE.fullmatch(value):
+            raise InvalidResponse(f"header {name}: the value is not visible ASCII")
         if name.lower() not in FRAMING_HEADERS:
-            out.append((name, value))
+            out[name.lower()] = (name, value)  # one header per name: the last one given wins
+    out = list(out.values())
     body = result.get("body", "")
     if body is None:
         body = ""
@@ -107,7 +124,7 @@ def to_response(result):
         raise InvalidResponse("body is not a string")
     if result.get("isBase64Encoded") is True:
         try:
-            return status, out, base64.b64decode(body, validate=True)
+            return status, out, base64.b64decode(body, validate=True)  # validate=True refuses a line break
         except ValueError:
             raise InvalidResponse("body is not valid base64") from None
     return status, out, body.encode()
@@ -146,18 +163,25 @@ class Server(http.server.ThreadingHTTPServer):
         self.inflight = Inflight()
         self.stopping = False
         self.timeout_seconds = _timeout()
-        try:
-            self.address_family = socket.AF_INET6
-            super().__init__(("::", port), RequestHandler, bind_and_activate=False)
-            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            self.server_bind()
-            self.server_activate()
-        except OSError as e:
-            self.socket.close()
-            if port == 0 or e.errno == 98:  # address in use: IPv4 would be in use too
-                raise
-            self.address_family = socket.AF_INET
-            super().__init__(("0.0.0.0", port), RequestHandler)
+        # dual-stack when the kernel has IPv6, IPv4 only when it does not (the socket call itself fails then)
+        for family, address in ((socket.AF_INET6, "::"), (socket.AF_INET, "0.0.0.0")):
+            self.address_family = family
+            try:
+                super().__init__((address, port), RequestHandler, bind_and_activate=False)
+            except OSError:
+                if family == socket.AF_INET:
+                    raise
+                continue
+            try:
+                if family == socket.AF_INET6:
+                    self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                self.server_bind()
+                self.server_activate()
+                return
+            except OSError:
+                self.socket.close()
+                if family == socket.AF_INET:
+                    raise
 
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
@@ -175,10 +199,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             data = bytearray()
             while True:
                 line = self.rfile.readline(1024)
-                try:
-                    size = int(line.split(b";")[0].strip(), 16)
-                except ValueError:
-                    raise BadRequest() from None
+                digits = line.split(b";")[0].strip().decode("latin-1")
+                if not CHUNK_SIZE.fullmatch(digits):  # not int(..., 16): it takes "-1", "0x5" and "1_0"
+                    raise BadRequest()
+                size = int(digits, 16)
                 if size == 0:
                     while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
                         pass
@@ -189,7 +213,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 data += self.rfile.read(size)
                 self.rfile.readline(8)
         raw = self.headers.get("Content-Length") or "0"
-        if not raw.isdigit():
+        if not (raw.isascii() and raw.isdigit()):
             raise BadRequest()
         length = int(raw)
         if length > MAX_BODY:
@@ -218,15 +242,19 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _send(self, status, headers, body, close=False):
         close = close or self.server.stopping
-        self.send_response(status)
+        self.send_response_only(status)
+        names = {name.lower() for name, _ in headers}
+        if "date" not in names:
+            self.send_header("Date", self.date_time_string())
         for name, value in headers:
             self.send_header(name, value)
-        self.send_header("Content-Length", str(len(body)))
+        if status != 204:  # RFC 9110: a 204 has no Content-Length
+            self.send_header("Content-Length", str(len(body)))
         if close:
             self.send_header("Connection", "close")
             self.close_connection = True
         self.end_headers()
-        if self.command != "HEAD" and status not in (204, 304) and not 100 <= status < 200:
+        if self.command != "HEAD" and status not in (204, 304):
             self.wfile.write(body)
 
     def _serve(self):
@@ -239,9 +267,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             if body is None:
                 return
-            split = urllib.parse.urlsplit(self.path)
+            path, raw_query = split_target(self.path)
             query = {}
-            for key, value in urllib.parse.parse_qsl(split.query, keep_blank_values=True):
+            for key, value in urllib.parse.parse_qsl(raw_query, keep_blank_values=True):
                 query[key] = query[key] + "," + value if key in query else value
             headers = {}
             for key in self.headers:
@@ -250,7 +278,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 text, is_b64 = body.decode("utf-8"), False
             except UnicodeDecodeError:
                 text, is_b64 = base64.b64encode(body).decode(), True
-            event = {"trigger": "http", "method": self.command, "path": split.path, "query": query,
+            event = {"trigger": "http", "method": self.command, "path": path, "query": query,
                      "headers": headers, "body": text, "isBase64Encoded": is_b64}
             context = _context(headers, self.server.timeout_seconds)
             try:
@@ -258,7 +286,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             except InvalidResponse as e:
                 print(f"invalid response ({context.request_id}): {e}", file=sys.stderr, flush=True)
                 status, out, payload = 500, [("Content-Type", "text/plain; charset=utf-8")], b"Internal Server Error"
-            except Exception:
+            except BaseException:  # SystemExit from the function is its error too
                 print(f"function error ({context.request_id}):\n{traceback.format_exc()}", file=sys.stderr, flush=True)
                 status, out, payload = 500, [("Content-Type", "text/plain; charset=utf-8")], b"Internal Server Error"
             self._send(status, out, payload)
@@ -269,11 +297,13 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
 
 
 def run_http(handler):
+    raw = os.environ.get("PORT") or "8080"
+    if not (raw.isascii() and raw.isdigit() and int(raw) <= 65535):
+        sys.exit(f"PORT {raw!r} is not a number")
     try:
-        port = int(os.environ.get("PORT", "8080"))
-    except ValueError:
-        sys.exit(f"PORT {os.environ['PORT']!r} is not a number")
-    server = Server(port, handler)
+        server = Server(int(raw), handler)
+    except OSError as e:
+        sys.exit(f"cannot listen on {raw}: {e}")
 
     def stop():
         server.stopping = True
@@ -297,7 +327,11 @@ def run_cron(handler):
     context = _context({}, _timeout())
     code = 0
     try:
-        handler(event, context)
+        result = handler(event, context)
+        if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
+            raise InvalidResponse("the handler is async: the Python runtime calls a plain function")
     except BaseException:
         traceback.print_exc()
         code = 1
@@ -307,7 +341,9 @@ def run_cron(handler):
 
 
 def main():
-    trigger = os.environ.get("TITAN_TRIGGER", "http")
+    # PID 1 has no default action for SIGTERM: until the real handler is in, ending is all there is to do
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(143))
+    trigger = os.environ.get("TITAN_TRIGGER") or "http"
     if trigger not in ("http", "cron"):
         sys.exit(f"TITAN_TRIGGER {trigger!r} is neither http nor cron")
     try:

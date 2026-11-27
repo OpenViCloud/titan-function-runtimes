@@ -49,13 +49,33 @@ class Images(unittest.TestCase):
         for d, name in RUNTIMES.items():
             self.assertRegex(ci, rf"dir: {d}\s+name: {re.escape(name)}\b", d)
 
-    def test_the_push_is_one_manifest_and_only_from_main(self):
+    def jobs(self):
         ci = read(".github", "workflows", "ci.yml")
-        push = ci[ci.index("\n  push:"):]
+        text = ci[ci.index("\njobs:"):]
+        parts = re.split(r"\n  (?=[a-z]+:\n    name:)", text)[1:]
+        return {p.split(":", 1)[0]: p for p in parts}
+
+    def test_the_push_is_one_manifest_and_only_from_main(self):
+        jobs = self.jobs()
+        self.assertEqual(sorted(jobs), ["image", "push", "test"])
+        push = jobs["push"]
         self.assertIn("provenance: false", push)
         self.assertIn("platforms: linux/amd64", push)
         self.assertIn("if: github.event_name == 'push' && github.ref == 'refs/heads/main'", push)
-        self.assertEqual(ci.count("push: true"), 1)
+        self.assertIn("push: true", push)
+
+    def test_only_the_push_job_can_write_packages_or_push(self):
+        for name, job in self.jobs().items():
+            if name != "push":
+                self.assertNotIn("packages: write", job, name)
+                self.assertNotIn("push: true", job, name)
+                self.assertNotIn("docker/login-action", job, name)
+
+    def test_the_docker_actions_are_pinned_by_commit(self):
+        uses = re.findall(r"uses: (docker/\S+)", read(".github", "workflows", "ci.yml"))
+        self.assertTrue(uses)
+        for u in uses:
+            self.assertRegex(u, r"^docker/[\w-]+@[0-9a-f]{40}$", u)
 
     def test_the_go_image_has_no_toolchain(self):
         text = read("go", "Dockerfile")

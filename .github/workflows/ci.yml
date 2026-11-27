@@ -1,5 +1,6 @@
 name: CI
 
+# The Docker actions hold packages: write in the push job, so they are pinned by commit (the comment names the release).
 # Tests of the three adapters and of the Go library, the contract suite that runs every adapter through the same cases,
 # and the three runtime images: built on every run, pushed to GHCR only from main once the tests passed, tagged with the
 # full commit sha. One manifest per image (no provenance index): the function cluster composes images from it.
@@ -23,7 +24,7 @@ jobs:
       # `titan-ops <path under its docs/>#<anchor>` instead.
       - name: No URL into private titan-ops
         run: |
-          if git grep -n -I -i -E 'github\.com/openvicloud/titan-ops([^[:alnum:]_-]|$)' -- ':/'; then
+          if git grep -n -I -i -E 'github(usercontent)?\.com[:/](repos/)?openvicloud/titan-ops([^[:alnum:]_-]|$)' -- ':/'; then
             echo "URL into private titan-ops above: write titan-ops <path>#<anchor>"; exit 1
           fi
 
@@ -72,9 +73,9 @@ jobs:
             name: go
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.dir }}
           platforms: linux/amd64
@@ -101,16 +102,16 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push
         id: push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.dir }}
           platforms: linux/amd64

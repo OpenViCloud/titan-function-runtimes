@@ -28,6 +28,8 @@ INVALID = [
     {"statusCode": 200, "body": 5},
     {"statusCode": 200, "isBase64Encoded": True, "body": "not base64!"},
     {"statusCode": True},
+    {"statusCode": 100},
+    {"statusCode": 199},
 ]
 
 
@@ -47,6 +49,8 @@ def handler(event, context):
         return {"statusCode": int(query["code"]), "headers": {"x-a": "b"}, "body": "ok"}
     if path == "/string":
         return "hello"
+    if path == "/exit":
+        raise SystemExit(3)
     if path == "/throw":
         raise RuntimeError("boom-secret")
     if path == "/bad":
@@ -57,6 +61,12 @@ def handler(event, context):
         return {"statusCode": 200, "headers": {"Content-Length": "1", "Connection": "close", "X-Ok": "1"}, "body": "hello"}
     if path == "/b64":
         return {"statusCode": 200, "isBase64Encoded": True, "body": base64.b64encode(b"\x00\xffAB").decode()}
+    if path == "/nonascii":
+        return {"statusCode": 200, "headers": {"x-a": "é€"}, "body": "x"}
+    if path == "/b64nl":
+        return {"statusCode": 200, "isBase64Encoded": True, "body": "QU\nJD"}
+    if path == "/date":
+        return {"statusCode": 200, "headers": {"Date": "Thu, 01 Jan 1970 00:00:00 GMT"}, "body": "x"}
     if path == "/badhead":
         return {"statusCode": 200, "headers": {"bad name": "x"}, "body": "x"}
     if path == "/len":
@@ -70,4 +80,4 @@ def handler(event, context):
         first = context.get_remaining_time_in_millis()
         time.sleep(0.3)
         return _json([first, context.get_remaining_time_in_millis()])
-    return {"statusCode": 404, "body": "no such fixture route"}
+    return {"statusCode": 404, "body": "path=" + path}

@@ -55,7 +55,10 @@ func handler(ctx context.Context, e function.Event) (function.Response, error) {
 	case "/throw":
 		return function.Response{}, errors.New("boom-secret")
 	case "/bad":
-		// the typed Response cannot be a wrong shape; its invalid values are a status outside 100-599
+		// the typed Response cannot be a wrong shape; its invalid values are a status outside 200-599
+		if e.Query["n"] == "1" {
+			return function.Response{StatusCode: 199, Body: "x"}, nil
+		}
 		return function.Response{StatusCode: 600, Body: "x"}, nil
 	case "/crlf":
 		return function.Response{StatusCode: 200, Headers: map[string]string{"x-a": "b\r\nx-evil: 1"}, Body: "x"}, nil
@@ -63,6 +66,12 @@ func handler(ctx context.Context, e function.Event) (function.Response, error) {
 		return function.Response{StatusCode: 200, Headers: map[string]string{"Content-Length": "1", "Connection": "close", "X-Ok": "1"}, Body: "hello"}, nil
 	case "/b64":
 		return function.Response{StatusCode: 200, IsBase64Encoded: true, Body: base64.StdEncoding.EncodeToString([]byte{0, 255, 'A', 'B'})}, nil
+	case "/nonascii":
+		return function.Response{StatusCode: 200, Headers: map[string]string{"x-a": "é€"}, Body: "x"}, nil
+	case "/b64nl":
+		return function.Response{StatusCode: 200, IsBase64Encoded: true, Body: "QU\nJD"}, nil
+	case "/date":
+		return function.Response{StatusCode: 200, Headers: map[string]string{"Date": "Thu, 01 Jan 1970 00:00:00 GMT"}, Body: "x"}, nil
 	case "/badhead":
 		return function.Response{StatusCode: 200, Headers: map[string]string{"bad name": "x"}, Body: "x"}, nil
 	case "/len":
@@ -81,7 +90,7 @@ func handler(ctx context.Context, e function.Event) (function.Response, error) {
 		time.Sleep(300 * time.Millisecond)
 		return reply([]any{first, remaining(ctx)}), nil
 	}
-	return function.Response{StatusCode: 404, Body: "no such fixture route"}, nil
+	return function.Response{StatusCode: 404, Body: "path=" + e.Path}, nil
 }
 
 func main() { function.Start(handler) }
