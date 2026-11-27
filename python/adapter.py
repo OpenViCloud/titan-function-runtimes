@@ -206,6 +206,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     for _ in range(64):  # trailers: read, ignore, and not without end
                         if self.rfile.readline(1024) in (b"\r\n", b"\n", b""):
                             break
+                    else:
+                        self.close_connection = True  # what is left on the wire is not a next request
                     return bytes(data)
                 if len(data) + size > MAX_BODY:
                     self._too_large()
@@ -215,6 +217,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         raw = self.headers.get("Content-Length") or "0"
         if not (raw.isascii() and raw.isdigit()):
             raise BadRequest()
+        raw = raw.lstrip("0") or "0"
         length = int(raw) if len(raw) <= 12 else MAX_BODY + 1  # int() of thousands of digits raises
         if length > MAX_BODY:
             self._too_large()
@@ -297,7 +300,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self.server.inflight.leave()
 
     def __getattr__(self, name):
-        if name.startswith("do_"):  # any method, as the other runtimes: the function sees PROPFIND and PURGE too
+        if name.startswith("do_"):  # any method http.server parses: the function sees PROPFIND and PURGE too
             return self._serve
         raise AttributeError(name)
 
@@ -320,7 +323,7 @@ def run_http(handler):
 
     # serve_forever runs on this thread, and shutdown() waits for it to return: stop on another thread
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=stop, daemon=True).start())
-    server.serve_forever()
+    server.serve_forever(poll_interval=0.05)  # shutdown() waits for one poll: keep it short, the stop has 2 s
     # serve_forever returns on SIGTERM; the thread above exits the process once the requests in flight are done
     threading.Event().wait()
 

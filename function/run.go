@@ -26,13 +26,13 @@ import (
 const (
 	maxBody      = 6 * 1024 * 1024
 	shutdownWait = 2 * time.Second
-	// a timeout longer than this is this long (the Python adapter cannot count in milliseconds beyond it)
+	// a timeout longer than this is this long (a time.Duration holds about 9.2e9 seconds)
 	maxTimeoutSeconds = 1e9
 )
 
 var plainDecimal = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
 
-// started is true once Start has installed its own SIGTERM handling. Before that (the program's initialisation, which runs
+// started is true once Start has its own SIGTERM channel: from then on a signal is Start's, buffered until its loop reads it. Before that (the program's initialisation, which runs
 // after this package's init) a SIGTERM would be ignored by a process that is PID 1: end it, as the other adapters do.
 var started atomic.Bool
 
@@ -77,8 +77,9 @@ func configFrom(getenv func(string) string, now time.Time) (config, error) {
 	}
 	// anything but a positive finite number of seconds means no deadline
 	if raw := getenv("TITAN_TIMEOUT_SECONDS"); plainDecimal.MatchString(raw) {
-		if s, err := strconv.ParseFloat(raw, 64); err == nil && s > 0 {
-			c.timeout = time.Duration(math.Min(s, maxTimeoutSeconds) * float64(time.Second))
+		// ParseFloat reports a number beyond float64 as +Inf with ErrRange: still a (clamped) number of seconds
+		if s, err := strconv.ParseFloat(raw, 64); (err == nil || errors.Is(err, strconv.ErrRange)) && s > 0 {
+			c.timeout = max(time.Duration(math.Min(s, maxTimeoutSeconds)*float64(time.Second)), 1) // a tiny one is a deadline too
 		}
 	}
 	if c.scheduledTime == "" {
@@ -89,16 +90,18 @@ func configFrom(getenv func(string) string, now time.Time) (config, error) {
 
 // Start runs the function until the process is told to stop, then exits: it never returns.
 func Start(h Handler) {
-	started.Store(true)
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, syscall.SIGTERM)
+	started.Store(true) // after Notify: a signal in between would find neither handler
 	cfg, err := configFrom(os.Getenv, time.Now())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	if cfg.trigger == "cron" {
-		os.Exit(runCron(h, cfg))
+		os.Exit(runCron(h, cfg, term))
 	}
-	os.Exit(runHTTP(h, cfg))
+	os.Exit(runHTTP(h, cfg, term))
 }
 
 func newContext(parent context.Context, cfg config, requestID string) (context.Context, context.CancelFunc) {
@@ -109,9 +112,7 @@ func newContext(parent context.Context, cfg config, requestID string) (context.C
 	return ctx, func() {}
 }
 
-func runCron(h Handler, cfg config) int {
-	term := make(chan os.Signal, 1)
-	signal.Notify(term, syscall.SIGTERM)
+func runCron(h Handler, cfg config, term <-chan os.Signal) int {
 	go func() {
 		<-term
 		os.Exit(143)
@@ -126,15 +127,13 @@ func runCron(h Handler, cfg config) int {
 	return 0
 }
 
-func runHTTP(h Handler, cfg config) int {
+func runHTTP(h Handler, cfg config, term <-chan os.Signal) int {
 	ln, err := net.Listen("tcp", ":"+cfg.port)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cannot listen:", err)
 		return 1
 	}
 	srv := &http.Server{Handler: &adapter{h: h, cfg: cfg}}
-	term := make(chan os.Signal, 1)
-	signal.Notify(term, syscall.SIGTERM)
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()
 	select {
@@ -254,6 +253,14 @@ func unescape(s string) string {
 	return b.String()
 }
 
+// validUTF8 turns each byte that is not valid UTF-8 into U+FFFD, as the Python and Node.js adapters decode it.
+func validUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return string([]rune(s))
+}
+
 func isHex(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
@@ -270,7 +277,7 @@ func parseQuery(raw string) map[string]string {
 			continue
 		}
 		name, value, _ := strings.Cut(pair, "=")
-		name, value = unescape(name), unescape(value)
+		name, value = validUTF8(unescape(name)), validUTF8(unescape(value))
 		if old, ok := query[name]; ok {
 			value = old + "," + value
 		}

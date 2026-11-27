@@ -114,6 +114,17 @@ class Listening(unittest.TestCase):
         self.assertEqual(server.socket.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY), 0)
 
 
+class PortInUse(unittest.TestCase):
+    def test_a_port_that_is_taken_is_an_error_not_a_reason_to_try_another_family(self):
+        holder = socket.socket(socket.AF_INET6)
+        self.addCleanup(holder.close)
+        holder.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        holder.bind(("::", 0))
+        holder.listen()
+        with self.assertRaises(OSError):
+            adapter.Server(holder.getsockname()[1], lambda e, c: "x")
+
+
 class Context(unittest.TestCase):
     def test_remaining_time_is_none_without_a_deadline_and_never_negative(self):
         self.assertIsNone(adapter.Context("f", "v", "r", None).get_remaining_time_in_millis())

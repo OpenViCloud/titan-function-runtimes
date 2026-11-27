@@ -43,7 +43,7 @@ test('a module outside the code dir is not loaded through ..', async () => {
   await assert.rejects(loadHandler('../index.handler', inner), /no module|outside/);
 });
 
-test('a string is a 200 text/plain; an object needs a statusCode from 100 to 599', () => {
+test('a string is a 200 text/plain; an object needs a statusCode from 200 to 599', () => {
   assert.deepEqual(toResponse('é'), { status: 200, headers: [['content-type', 'text/plain; charset=utf-8']], body: Buffer.from('é') });
   assert.equal(toResponse({ statusCode: 204 }).body.length, 0);
   for (const bad of [undefined, null, 5, [], {}, { statusCode: '200' }, { statusCode: 200.5 }, { statusCode: 99 }, { statusCode: 100 }, { statusCode: 199 }, { statusCode: 600 }, { statusCode: 200, headers: { a: 'é' } },

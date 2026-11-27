@@ -1,6 +1,7 @@
 name: CI
 
-# The Docker actions hold packages: write in the push job, so they are pinned by commit (the comment names the release).
+# The Docker actions run with packages: write in the push job, so they are pinned by commit (the comment names the release);
+# the first-party actions/* are pinned by major tag.
 # Tests of the three adapters and of the Go library, the contract suite that runs every adapter through the same cases,
 # and the three runtime images: built on every run, pushed to GHCR only from main once the tests passed, tagged with the
 # full commit sha. One manifest per image (no provenance index): the function cluster composes images from it.

@@ -263,6 +263,16 @@ class Contract:
         p = self.serve()
         self.assertEqual(request(p.port, "GET", "/echo??x=1").json()["event"]["query"], {"?x": "1"})
 
+    def test_a_content_length_with_leading_zeros_is_its_value(self):
+        p = self.serve()
+        s = socket.create_connection(("127.0.0.1", p.port), timeout=10)
+        s.sendall(b"POST /len HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 00000000000003\r\n\r\nabc")
+        raw = b""
+        while chunk := s.recv(4096):
+            raw += chunk
+        s.close()
+        self.assertTrue(raw.startswith(b"HTTP/1.1 200") and raw.endswith(b"\r\n\r\n3"), raw)
+
     def test_a_content_length_of_thousands_of_digits_is_refused_not_dropped(self):
         p = self.serve()
         s = socket.create_connection(("127.0.0.1", p.port), timeout=10)
@@ -273,8 +283,8 @@ class Contract:
 
     def test_the_query_keeps_odd_names_and_odd_escapes(self):
         p = self.serve()
-        got = request(p.port, "GET", "/echo?constructor=1&toString=2&__proto__=3&a=1;b=2&c=%zz&d=a+b&e=%zz%41&f=%zz+c").json()["event"]["query"]
-        self.assertEqual(got, {"constructor": "1", "toString": "2", "__proto__": "3", "a": "1;b=2", "c": "%zz", "d": "a b", "e": "%zzA", "f": "%zz c"})
+        got = request(p.port, "GET", "/echo?constructor=1&toString=2&__proto__=3&a=1;b=2&c=%zz&d=a+b&e=%zz%41&f=%zz+c&g=%ff%fe").json()["event"]["query"]
+        self.assertEqual(got, {"constructor": "1", "toString": "2", "__proto__": "3", "a": "1;b=2", "c": "%zz", "d": "a b", "e": "%zzA", "f": "%zz c", "g": "\ufffd\ufffd"})
 
     def test_a_utf8_body_keeps_its_byte_order_mark(self):
         p = self.serve()
@@ -363,7 +373,7 @@ class Contract:
         self.assertNotEqual(a["requestId"], b["requestId"])
         self.assertIsNone(a["remainingMs"], "without TITAN_TIMEOUT_SECONDS there is no deadline to report")
 
-    def test_a_timeout_that_is_not_a_positive_number_means_no_deadline(self):
+    def test_a_timeout_that_is_not_a_plain_decimal_means_no_deadline(self):
         for value in ("0", "-5", "abc", "inf", "nan", "", " 5 ", "5_0", "0x10", "1e10", "1e308"):
             p = self.serve(TITAN_TIMEOUT_SECONDS=value)
             self.assertIsNone(request(p.port, "GET", "/echo").json()["context"]["remainingMs"], value)
@@ -461,6 +471,19 @@ class Contract:
             raw += chunk
         s.close()
         self.assertEqual(len(raw.split(b"\r\n\r\n", 1)[1]), 8_000_000)
+        self.assertEqual(p.wait(5), 0, p.stderr())
+
+    def test_a_second_sigterm_while_draining_changes_nothing(self):
+        p = self.serve()
+        out = {}
+        t = threading.Thread(target=lambda: out.update(r=request(p.port, "GET", "/sleep?ms=800")))
+        t.start()
+        time.sleep(0.3)
+        p.proc.send_signal(signal.SIGTERM)
+        time.sleep(0.1)
+        p.proc.send_signal(signal.SIGTERM)
+        t.join(10)
+        self.assertEqual((out["r"].status, out["r"].body), (200, b"slept"))
         self.assertEqual(p.wait(5), 0, p.stderr())
 
     def test_sigterm_does_not_wait_for_a_long_request(self):

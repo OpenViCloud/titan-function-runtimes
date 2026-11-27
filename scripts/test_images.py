@@ -87,11 +87,19 @@ class Images(unittest.TestCase):
                 self.assertNotIn("push: true", job, name)
                 self.assertNotIn("docker/login-action", job, name)
 
-    def test_the_docker_actions_are_pinned_by_commit(self):
-        uses = re.findall(r"uses: (docker/\S+)", read(".github", "workflows", "ci.yml"))
-        self.assertTrue(uses)
+    def test_every_action_outside_actions_is_pinned_by_commit(self):
+        uses = re.findall(r"uses: (\S+)", read(".github", "workflows", "ci.yml"))
+        self.assertTrue([u for u in uses if u.startswith("docker/")])
         for u in uses:
-            self.assertRegex(u, r"^docker/[\w-]+@[0-9a-f]{40}$", u)
+            if not u.startswith("actions/"):
+                self.assertRegex(u, r"^[\w-]+/[\w-]+@[0-9a-f]{40}$", u)
+
+    def test_the_jobs_that_do_not_push_have_no_permissions_secrets_or_push_expression(self):
+        for name, job in self.jobs().items():
+            if name != "push":
+                self.assertNotIn("permissions:", job, name)
+                self.assertNotIn("secrets.", job, name)
+                self.assertNotRegex(job, r"push: (?!false\b)", name)
 
     def test_the_go_image_has_no_toolchain(self):
         text = read("go", "Dockerfile")

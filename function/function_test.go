@@ -3,6 +3,7 @@ package function
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -26,7 +27,7 @@ func TestConfigFrom(t *testing.T) {
 			t.Errorf("%v should be refused", bad)
 		}
 	}
-	for _, v := range []string{"x", "0", "-1", "inf", "nan", "", " 5 ", "5_0", "0x10", "1e10", "1e308"} {
+	for _, v := range []string{"x", "0", "-1", "inf", "nan", "", " 5 ", "5_0", "0x10", "1e10", "1e308", ".5", "5.", "+5"} {
 		if c, _ := configFrom(env(map[string]string{"TITAN_TIMEOUT_SECONDS": v}), now); c.timeout != 0 {
 			t.Errorf("TITAN_TIMEOUT_SECONDS=%q means no deadline, got %v", v, c.timeout)
 		}
@@ -129,8 +130,8 @@ func TestSplitTarget(t *testing.T) {
 }
 
 func TestParseQueryKeepsWhatTheOtherRuntimesKeep(t *testing.T) {
-	got := parseQuery("a=1;b=2&c=%zz&d=%41&e=a+b&f&a2=1&a2=2&&=x&g=%zz%41&h=%zz+c&i=%4&j=%")
-	want := map[string]string{"a": "1;b=2", "c": "%zz", "d": "A", "e": "a b", "f": "", "a2": "1,2", "": "x", "g": "%zzA", "h": "%zz c", "i": "%4", "j": "%"}
+	got := parseQuery("a=1;b=2&c=%zz&d=%41&e=a+b&f&a2=1&a2=2&&=x&g=%zz%41&h=%zz+c&i=%4&j=%&k=%ff%fe")
+	want := map[string]string{"a": "1;b=2", "c": "%zz", "d": "A", "e": "a b", "f": "", "a2": "1,2", "": "x", "g": "%zzA", "h": "%zz c", "i": "%4", "j": "%", "k": "\ufffd\ufffd"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v", got)
 	}
@@ -138,5 +139,19 @@ func TestParseQueryKeepsWhatTheOtherRuntimesKeep(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("%q: got %q, want %q", k, got[k], v)
 		}
+	}
+}
+
+// The window between "started" and Start's own Notify swallowed a SIGTERM (a microseconds-wide race, found by an audit with
+// 750 spawns): the init handler stops handling once started is true, so Start must be able to receive before it says so.
+func TestStartHasItsSignalChannelBeforeItSaysItStarted(t *testing.T) {
+	src, err := os.ReadFile("run.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	notify := strings.Index(string(src), "signal.Notify(term, syscall.SIGTERM)")
+	started := strings.Index(string(src), "started.Store(true)")
+	if notify < 0 || started < 0 || notify > started {
+		t.Fatalf("signal.Notify(term...) must come before started.Store(true): %d, %d", notify, started)
 	}
 }

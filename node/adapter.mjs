@@ -190,6 +190,7 @@ function runHttp(handler) {
   server.on('error', (e) => fail(`cannot listen on ${port}: ${e.message}`));
 
   onTerm = () => {
+    if (stopping) return; // a second SIGTERM while draining changes nothing
     if (!server.listening) process.exit(143); // not serving yet: nothing to finish
     stopping = true;
     // Stop listening, and only that: http.Server.close() also destroys the connections it thinks idle, and one whose response
