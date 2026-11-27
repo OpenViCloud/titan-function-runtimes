@@ -1,0 +1,163 @@
+package function
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+)
+
+func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+
+func TestConfigFrom(t *testing.T) {
+	now := time.Date(2026, 11, 27, 10, 5, 42, 0, time.UTC)
+	c, err := configFrom(env(nil), now)
+	if err != nil || c.port != "8080" || c.trigger != "http" || c.timeout != 0 || c.scheduledTime != "2026-11-27T10:05:00Z" {
+		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	c, err = configFrom(env(map[string]string{"PORT": "9000", "TITAN_TRIGGER": "cron", "TITAN_TIMEOUT_SECONDS": "2.5", "TITAN_SCHEDULED_TIME": "2026-01-01T00:00:00Z"}), now)
+	if err != nil || c.port != "9000" || c.trigger != "cron" || c.timeout != 2500*time.Millisecond || c.scheduledTime != "2026-01-01T00:00:00Z" {
+		t.Fatalf("set: %+v %v", c, err)
+	}
+	for _, bad := range []map[string]string{{"PORT": "abc"}, {"PORT": "70000"}, {"PORT": "-1"}, {"PORT": "+80"}, {"PORT": " 80"}, {"TITAN_TRIGGER": "queue"}} {
+		if _, err := configFrom(env(bad), now); err == nil {
+			t.Errorf("%v should be refused", bad)
+		}
+	}
+	for _, v := range []string{"x", "0", "-1", "inf", "nan", "", " 5 ", "5_0", "0x10", "1e10", "1e308", ".5", "5.", "+5"} {
+		if c, _ := configFrom(env(map[string]string{"TITAN_TIMEOUT_SECONDS": v}), now); c.timeout != 0 {
+			t.Errorf("TITAN_TIMEOUT_SECONDS=%q means no deadline, got %v", v, c.timeout)
+		}
+	}
+	// a number beyond float64 and one below a nanosecond are still deadlines: the other runtimes say so
+	for v, atLeast := range map[string]time.Duration{strings.Repeat("9", 400): 1e9 * time.Second, "0.0000000001": 1} {
+		if c, _ := configFrom(env(map[string]string{"TITAN_TIMEOUT_SECONDS": v}), now); c.timeout != atLeast {
+			t.Errorf("TITAN_TIMEOUT_SECONDS=%.12s... gave %v, want %v", v, c.timeout, atLeast)
+		}
+	}
+	if _, err := configFrom(env(map[string]string{"TITAN_TRIGGER": "cron", "PORT": "abc"}), now); err != nil {
+		t.Errorf("a cron run does not read PORT: %v", err)
+	}
+}
+
+func TestCheck(t *testing.T) {
+	good := []Response{
+		{StatusCode: 200}, {StatusCode: 204}, {StatusCode: 599}, {StatusCode: 200, Headers: map[string]string{"X-A": "b"}},
+		{StatusCode: 200, IsBase64Encoded: true, Body: "AP8="}, {StatusCode: 200, IsBase64Encoded: true, Body: "YR=="},
+	}
+	for _, r := range good {
+		if _, err := check(&r); err != nil {
+			t.Errorf("%+v: %v", r, err)
+		}
+	}
+	bad := []Response{
+		{}, {StatusCode: 99}, {StatusCode: 100}, {StatusCode: 199}, {StatusCode: 600}, {StatusCode: 200, Headers: map[string]string{"a b": "x"}},
+		{StatusCode: 200, Headers: map[string]string{"": "x"}}, {StatusCode: 200, Headers: map[string]string{"a": "x\ny"}},
+		{StatusCode: 200, Headers: map[string]string{"a": "é"}}, {StatusCode: 200, Headers: map[string]string{"a": "\x01"}},
+		{StatusCode: 200, IsBase64Encoded: true, Body: "***"}, {StatusCode: 200, IsBase64Encoded: true, Body: "AP8"},
+		{StatusCode: 200, IsBase64Encoded: true, Body: "QU\nJD"},
+	}
+	for _, r := range bad {
+		if _, err := check(&r); err == nil {
+			t.Errorf("%+v should be refused", r)
+		}
+	}
+	b, _ := check(&Response{StatusCode: 200, IsBase64Encoded: true, Body: "AP8="})
+	if string(b) != "\x00\xff" {
+		t.Errorf("base64 body decoded to %q", b)
+	}
+}
+
+func TestEventJSONHasTheKeysOfTheOtherRuntimes(t *testing.T) {
+	keys := func(e Event) []string {
+		var m map[string]any
+		b, _ := json.Marshal(e)
+		json.Unmarshal(b, &m)
+		var out []string
+		for k := range m {
+			out = append(out, k)
+		}
+		return out
+	}
+	if got := len(keys(Event{Trigger: "http"})); got != 7 {
+		t.Errorf("an http event has %d keys, want 7", got)
+	}
+	if got := len(keys(Event{Trigger: "cron", Method: "ignored"})); got != 3 {
+		t.Errorf("a cron event has %d keys, want 3", got)
+	}
+}
+
+func TestInfoRidesTheContextAndTheDeadlineIsTheTimeout(t *testing.T) {
+	ctx, cancel := newContext(context.Background(), config{functionID: "f", versionID: "v", timeout: time.Minute}, "r")
+	defer cancel()
+	if i, ok := FromContext(ctx); !ok || i != (Info{"f", "v", "r"}) {
+		t.Errorf("info %+v %v", i, ok)
+	}
+	if d, ok := ctx.Deadline(); !ok || time.Until(d) > time.Minute || time.Until(d) < 59*time.Second {
+		t.Errorf("deadline %v %v", d, ok)
+	}
+	ctx, cancel = newContext(context.Background(), config{}, "r")
+	defer cancel()
+	if _, ok := ctx.Deadline(); ok {
+		t.Error("no timeout set, but there is a deadline")
+	}
+	if _, ok := FromContext(context.Background()); ok {
+		t.Error("a context that is not the function's has no Info")
+	}
+}
+
+func TestPanicIsAnError(t *testing.T) {
+	_, err := call(context.Background(), func(context.Context, Event) (Response, error) { panic("boom") }, Event{})
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestNewIDIsAUUID(t *testing.T) {
+	re := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	a, b := newID(), newID()
+	if !re.MatchString(a) || a == b {
+		t.Errorf("%s %s", a, b)
+	}
+}
+
+func TestSplitTarget(t *testing.T) {
+	for target, want := range map[string][2]string{
+		"/a/b?x=1": {"/a/b", "x=1"}, "//x/y?q=1": {"/x/y", "q=1"}, "http://h/abs": {"/abs", ""}, "http://h": {"/", ""},
+		"//": {"/", ""}, "*": {"/*", ""}, "/a%2Fb/../c?": {"/a%2Fb/../c", ""},
+	} {
+		if p, q := splitTarget(target); [2]string{p, q} != want {
+			t.Errorf("%q: got %q %q, want %q", target, p, q, want)
+		}
+	}
+}
+
+func TestParseQueryKeepsWhatTheOtherRuntimesKeep(t *testing.T) {
+	got := parseQuery("a=1;b=2&c=%zz&d=%41&e=a+b&f&a2=1&a2=2&&=x&g=%zz%41&h=%zz+c&i=%4&j=%&k=%ff%fe")
+	want := map[string]string{"a": "1;b=2", "c": "%zz", "d": "A", "e": "a b", "f": "", "a2": "1,2", "": "x", "g": "%zzA", "h": "%zz c", "i": "%4", "j": "%", "k": "\ufffd\ufffd"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%q: got %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// The window between "started" and Start's own Notify swallowed a SIGTERM (a microseconds-wide race, found by an audit with
+// 750 spawns): the init handler stops handling once started is true, so Start must be able to receive before it says so.
+func TestStartHasItsSignalChannelBeforeItSaysItStarted(t *testing.T) {
+	src, err := os.ReadFile("run.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	notify := strings.Index(string(src), "signal.Notify(term, syscall.SIGTERM)")
+	started := strings.Index(string(src), "started.Store(true)")
+	if notify < 0 || started < 0 || notify > started {
+		t.Fatalf("signal.Notify(term...) must come before started.Store(true): %d, %d", notify, started)
+	}
+}
