@@ -26,7 +26,7 @@ func TestConfigFrom(t *testing.T) {
 			t.Errorf("%v should be refused", bad)
 		}
 	}
-	for _, v := range []string{"x", "0", "-1", "inf", "nan", ""} {
+	for _, v := range []string{"x", "0", "-1", "inf", "nan", "", " 5 ", "5_0", "0x10", "1e10", "1e308"} {
 		if c, _ := configFrom(env(map[string]string{"TITAN_TIMEOUT_SECONDS": v}), now); c.timeout != 0 {
 			t.Errorf("TITAN_TIMEOUT_SECONDS=%q means no deadline, got %v", v, c.timeout)
 		}
@@ -39,7 +39,7 @@ func TestConfigFrom(t *testing.T) {
 func TestCheck(t *testing.T) {
 	good := []Response{
 		{StatusCode: 200}, {StatusCode: 204}, {StatusCode: 599}, {StatusCode: 200, Headers: map[string]string{"X-A": "b"}},
-		{StatusCode: 200, IsBase64Encoded: true, Body: "AP8="},
+		{StatusCode: 200, IsBase64Encoded: true, Body: "AP8="}, {StatusCode: 200, IsBase64Encoded: true, Body: "YR=="},
 	}
 	for _, r := range good {
 		if _, err := check(&r); err != nil {
@@ -129,8 +129,8 @@ func TestSplitTarget(t *testing.T) {
 }
 
 func TestParseQueryKeepsWhatTheOtherRuntimesKeep(t *testing.T) {
-	got := parseQuery("a=1;b=2&c=%zz&d=%41&e=a+b&f&a2=1&a2=2&&=x")
-	want := map[string]string{"a": "1;b=2", "c": "%zz", "d": "A", "e": "a b", "f": "", "a2": "1,2", "": "x"}
+	got := parseQuery("a=1;b=2&c=%zz&d=%41&e=a+b&f&a2=1&a2=2&&=x&g=%zz%41&h=%zz+c&i=%4&j=%")
+	want := map[string]string{"a": "1;b=2", "c": "%zz", "d": "A", "e": "a b", "f": "", "a2": "1,2", "": "x", "g": "%zzA", "h": "%zz c", "i": "%4", "j": "%"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v", got)
 	}

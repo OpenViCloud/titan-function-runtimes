@@ -7,11 +7,13 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const MAX_BODY = 6 * 1024 * 1024;
 const SHUTDOWN_WAIT_MS = 2000;
+const MAX_TIMEOUT = 1e9; // seconds; a longer timeout is this long
 const FRAMING_HEADERS = new Set(['content-length', 'transfer-encoding', 'connection', 'server']);
 const TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_VALUE = /^[\t\x20-\x7e]*$/; // visible ASCII: what every runtime sends as a header value
@@ -19,6 +21,11 @@ const TARGET = /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?]*)?([^?]*)(?:\?([\s\S]*))?$
 const EXTENSIONS = ['.mjs', '.js', '.cjs'];
 
 class InvalidResponse extends Error {}
+
+// One SIGTERM listener for the whole life of the process: its action is replaced as the adapter gets ready, so a signal that
+// arrives while a synchronous import blocks the event loop (and is delivered after it) reaches the action in force then.
+let onTerm = () => process.exit(143);
+process.on('SIGTERM', () => onTerm());
 
 function fail(message, code = 1) {
   process.stderr.write(message + '\n');
@@ -28,8 +35,9 @@ function fail(message, code = 1) {
 // TITAN_TIMEOUT_SECONDS as a number of seconds; anything but a positive finite number means no deadline
 function timeoutSeconds() {
   const raw = process.env.TITAN_TIMEOUT_SECONDS ?? '';
-  const n = raw.trim() === '' ? NaN : Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : null;
+  if (!/^[0-9]+(\.[0-9]+)?$/.test(raw)) return null; // plain decimals only: Number() also takes "0x10", " 5 ", "1e3"
+  const n = Math.min(Number(raw), MAX_TIMEOUT);
+  return n > 0 ? n : null;
 }
 
 // (path, raw query) of a request target: an absolute-form target loses its scheme and host, a leading run of slashes is one
@@ -116,6 +124,10 @@ function runHttp(handler) {
 
   const server = http.createServer(async (req, res) => {
     inflight++;
+    let counted = true;
+    const done = () => counted && ((counted = false), inflight--);
+    res.once('finish', done); // all of the response is out of the process
+    res.once('close', done); // or the peer went away
     const send = (status, headers, body) => {
       if (stopping) res.setHeader('connection', 'close');
       res.statusCode = status;
@@ -137,7 +149,7 @@ function runHttp(handler) {
       }
       const [path, rawQuery] = splitTarget(req.url);
       const query = new Map(); // not an object literal: a name like `constructor` or `__proto__` is a name here
-      for (const [k, v] of new URLSearchParams(rawQuery)) query.set(k, query.has(k) ? `${query.get(k)},${v}` : v);
+      for (const [k, v] of new URLSearchParams('&' + rawQuery)) query.set(k, query.has(k) ? `${query.get(k)},${v}` : v);
       const headers = new Map();
       for (const [k, v] of Object.entries(req.headersDistinct)) headers.set(k, v.join(', '));
       let text;
@@ -171,38 +183,32 @@ function runHttp(handler) {
         res.statusCode = 500;
         res.end();
       }
-    } finally {
-      inflight--;
     }
   });
   server.keepAliveTimeout = 0; // no idle timeout: the peer (queue-proxy) closes, as with the Python and Go adapters
   server.on('clientError', (_e, socket) => socket.end('HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\n'));
   server.on('error', (e) => fail(`cannot listen on ${port}: ${e.message}`));
-  // a promise the function left unhandled, or a throw in its timer, must not end PID 1 and the requests of other callers
-  process.on('unhandledRejection', (e) => process.stderr.write(`unhandled rejection:\n${e?.stack ?? e}\n`));
-  process.on('uncaughtException', (e) => process.stderr.write(`uncaught exception:\n${e?.stack ?? e}\n`));
 
-  process.removeAllListeners('SIGTERM'); // the start-up one
-  process.on('SIGTERM', () => {
+  onTerm = () => {
+    if (!server.listening) process.exit(143); // not serving yet: nothing to finish
     stopping = true;
-    server.close();
-    server.closeIdleConnections();
+    // Stop listening, and only that: http.Server.close() also destroys the connections it thinks idle, and one whose response
+    // was handed to the socket but is still being written looks idle, so its last bytes would be lost.
+    net.Server.prototype.close.call(server);
     const end = Date.now() + SHUTDOWN_WAIT_MS;
     const tick = setInterval(() => {
-      server.closeIdleConnections();
       if (inflight === 0 || Date.now() >= end) process.exit(0);
     }, 20);
     tick.unref?.();
     setTimeout(() => process.exit(0), SHUTDOWN_WAIT_MS + 100); // the interval alone would not keep an empty loop alive
-  });
+  };
   server.listen(port);
 }
 
 async function runCron(handler) {
   const scheduledTime = process.env.TITAN_SCHEDULED_TIME || new Date().toISOString().replace(/:\d\d\.\d+Z$/, ':00Z');
   const event = { trigger: 'cron', schedule: process.env.TITAN_SCHEDULE ?? '', scheduledTime };
-  process.removeAllListeners('SIGTERM'); // the start-up one
-  process.on('SIGTERM', () => process.exit(143));
+  onTerm = () => process.exit(143);
   let code = 0;
   try {
     await handler(event, makeContext(randomUUID()));
@@ -210,17 +216,19 @@ async function runCron(handler) {
     process.stderr.write(`${e?.stack ?? e}\n`);
     code = 1;
   }
-  process.exit(code);
+  // exit() on a pipe can cut what was written but not yet read: let both streams drain first
+  process.stdout.write('', () => process.stderr.write('', () => process.exit(code)));
 }
 
 async function main() {
-  // PID 1 has no default action for SIGTERM: until the real handler is in, ending is all there is to do
-  process.on('SIGTERM', () => process.exit(143));
+  // a promise the function left unhandled, or a throw in its timer, must not end PID 1 (HTTP) or turn a finished run into a failure (cron)
+  process.on('unhandledRejection', (e) => process.stderr.write(`unhandled rejection:\n${e?.stack ?? e}\n`));
+  process.on('uncaughtException', (e) => process.stderr.write(`uncaught exception:\n${e?.stack ?? e}\n`));
   const trigger = process.env.TITAN_TRIGGER || 'http';
   if (trigger !== 'http' && trigger !== 'cron') fail(`TITAN_TRIGGER ${JSON.stringify(trigger)} is neither http nor cron`);
   let handler;
   try {
-    handler = await loadHandler(process.env.TITAN_HANDLER ?? '', process.env.TITAN_FUNCTION_DIR ?? '/function');
+    handler = await loadHandler(process.env.TITAN_HANDLER ?? '', process.env.TITAN_FUNCTION_DIR || '/function');
   } catch (e) {
     fail(String(e?.stack ?? e));
   }

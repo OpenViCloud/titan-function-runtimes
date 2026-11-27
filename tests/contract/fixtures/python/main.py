@@ -39,6 +39,8 @@ def handler(event, context):
         mode = os.environ.get("FIXTURE_CRON", "")
         if mode == "fail":
             raise RuntimeError("cron-boom")
+        if mode == "bigout":
+            print("x" * 1_048_576, flush=True)
         if mode == "sleep":
             time.sleep(30)
         return None
@@ -49,6 +51,8 @@ def handler(event, context):
         return {"statusCode": int(query["code"]), "headers": {"x-a": "b"}, "body": "ok"}
     if path == "/string":
         return "hello"
+    if path == "/big":
+        return "a" * 8_000_000
     if path == "/exit":
         raise SystemExit(3)
     if path == "/throw":
@@ -58,7 +62,7 @@ def handler(event, context):
     if path == "/crlf":
         return {"statusCode": 200, "headers": {"x-a": "b\r\nx-evil: 1"}, "body": "x"}
     if path == "/framing":
-        return {"statusCode": 200, "headers": {"Content-Length": "1", "Connection": "close", "X-Ok": "1"}, "body": "hello"}
+        return {"statusCode": 200, "headers": {"Content-Length": "1", "Connection": "close", "Server": "evil", "X-Ok": "1"}, "body": "hello"}
     if path == "/b64":
         return {"statusCode": 200, "isBase64Encoded": True, "body": base64.b64encode(b"\x00\xffAB").decode()}
     if path == "/nonascii":

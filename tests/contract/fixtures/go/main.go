@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenViCloud/titan-function-runtimes/function"
@@ -35,6 +36,8 @@ func handler(ctx context.Context, e function.Event) (function.Response, error) {
 		switch os.Getenv("FIXTURE_CRON") {
 		case "fail":
 			return function.Response{}, errors.New("cron-boom")
+		case "bigout":
+			fmt.Println(strings.Repeat("x", 1_048_576))
 		case "sleep":
 			time.Sleep(30 * time.Second)
 		}
@@ -47,6 +50,8 @@ func handler(ctx context.Context, e function.Event) (function.Response, error) {
 			"event":   e,
 			"context": map[string]any{"functionId": info.FunctionID, "versionId": info.VersionID, "requestId": info.RequestID, "remainingMs": remaining(ctx)},
 		}), nil
+	case "/big":
+		return function.Text(strings.Repeat("a", 8_000_000)), nil
 	case "/status":
 		code, _ := strconv.Atoi(e.Query["code"])
 		return function.Response{StatusCode: code, Headers: map[string]string{"x-a": "b"}, Body: "ok"}, nil
@@ -63,7 +68,7 @@ func handler(ctx context.Context, e function.Event) (function.Response, error) {
 	case "/crlf":
 		return function.Response{StatusCode: 200, Headers: map[string]string{"x-a": "b\r\nx-evil: 1"}, Body: "x"}, nil
 	case "/framing":
-		return function.Response{StatusCode: 200, Headers: map[string]string{"Content-Length": "1", "Connection": "close", "X-Ok": "1"}, Body: "hello"}, nil
+		return function.Response{StatusCode: 200, Headers: map[string]string{"Content-Length": "1", "Connection": "close", "Server": "evil", "X-Ok": "1"}, Body: "hello"}, nil
 	case "/b64":
 		return function.Response{StatusCode: 200, IsBase64Encoded: true, Body: base64.StdEncoding.EncodeToString([]byte{0, 255, 'A', 'B'})}, nil
 	case "/nonascii":

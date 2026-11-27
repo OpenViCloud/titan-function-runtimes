@@ -10,7 +10,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -18,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -26,7 +26,26 @@ import (
 const (
 	maxBody      = 6 * 1024 * 1024
 	shutdownWait = 2 * time.Second
+	// a timeout longer than this is this long (the Python adapter cannot count in milliseconds beyond it)
+	maxTimeoutSeconds = 1e9
 )
+
+var plainDecimal = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
+
+// started is true once Start has installed its own SIGTERM handling. Before that (the program's initialisation, which runs
+// after this package's init) a SIGTERM would be ignored by a process that is PID 1: end it, as the other adapters do.
+var started atomic.Bool
+
+func init() {
+	early := make(chan os.Signal, 1)
+	signal.Notify(early, syscall.SIGTERM)
+	go func() {
+		<-early
+		if !started.Load() {
+			os.Exit(143)
+		}
+	}()
+}
 
 type config struct {
 	port          string
@@ -57,8 +76,10 @@ func configFrom(getenv func(string) string, now time.Time) (config, error) {
 		return c, fmt.Errorf("PORT %q is not a number", c.port)
 	}
 	// anything but a positive finite number of seconds means no deadline
-	if s, err := strconv.ParseFloat(getenv("TITAN_TIMEOUT_SECONDS"), 64); err == nil && s > 0 && !math.IsInf(s, 0) && !math.IsNaN(s) {
-		c.timeout = time.Duration(s * float64(time.Second))
+	if raw := getenv("TITAN_TIMEOUT_SECONDS"); plainDecimal.MatchString(raw) {
+		if s, err := strconv.ParseFloat(raw, 64); err == nil && s > 0 {
+			c.timeout = time.Duration(math.Min(s, maxTimeoutSeconds) * float64(time.Second))
+		}
 	}
 	if c.scheduledTime == "" {
 		c.scheduledTime = now.UTC().Truncate(time.Minute).Format("2006-01-02T15:04:05Z")
@@ -68,6 +89,7 @@ func configFrom(getenv func(string) string, now time.Time) (config, error) {
 
 // Start runs the function until the process is told to stop, then exits: it never returns.
 func Start(h Handler) {
+	started.Store(true)
 	cfg, err := configFrom(os.Getenv, time.Now())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -155,7 +177,7 @@ func (a *adapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !utf8.Valid(body) {
 		text, isB64 = base64.StdEncoding.EncodeToString(body), true
 	}
-	requestID := r.Header.Get("X-Request-Id")
+	requestID := headers["x-request-id"] // joined like the other runtimes when the header is repeated
 	if requestID == "" {
 		requestID = newID()
 	}
@@ -211,6 +233,31 @@ func splitTarget(target string) (string, string) {
 	return "/" + strings.TrimLeft(m[1], "/"), m[2]
 }
 
+// unescape decodes "+" and every valid %XX; what is not a valid escape stays as written.
+func unescape(s string) string {
+	if !strings.ContainsAny(s, "%+") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch {
+		case s[i] == '+':
+			b.WriteByte(' ')
+		case s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]):
+			v, _ := strconv.ParseUint(s[i+1:i+3], 16, 8)
+			b.WriteByte(byte(v))
+			i += 2
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
 // parseQuery reads a raw query the way the Python and Node.js adapters do: pairs split on "&" only, a name or value that is
 // not a valid escape stays as written, repeated names are joined with ",". (r.URL.Query drops such pairs.)
 func parseQuery(raw string) map[string]string {
@@ -223,12 +270,7 @@ func parseQuery(raw string) map[string]string {
 			continue
 		}
 		name, value, _ := strings.Cut(pair, "=")
-		if n, err := url.QueryUnescape(name); err == nil {
-			name = n
-		}
-		if v, err := url.QueryUnescape(value); err == nil {
-			value = v
-		}
+		name, value = unescape(name), unescape(value)
 		if old, ok := query[name]; ok {
 			value = old + "," + value
 		}
@@ -276,7 +318,7 @@ func call(ctx context.Context, h Handler, e Event) (resp Response, err error) {
 
 func framing(name string) bool {
 	switch strings.ToLower(name) {
-	case "content-length", "transfer-encoding", "connection":
+	case "content-length", "transfer-encoding", "connection", "server":
 		return true
 	}
 	return false
@@ -303,7 +345,7 @@ func check(resp *Response) ([]byte, error) {
 		if strings.ContainsAny(resp.Body, "\r\n") { // the decoder would skip them
 			return nil, errors.New("body is not valid base64")
 		}
-		b, err := base64.StdEncoding.Strict().DecodeString(resp.Body)
+		b, err := base64.StdEncoding.DecodeString(resp.Body)
 		if err != nil {
 			return nil, errors.New("body is not valid base64")
 		}

@@ -213,6 +213,7 @@ class Contract:
         self.assertEqual((r.status, r.body, r.headers.get("x-ok")), (200, b"hello", "1"))
         self.assertEqual(r.headers["content-length"], "5")
         self.assertNotEqual(r.headers.get("connection"), "close", "a customer cannot close the connection for the adapter")
+        self.assertNotIn("server", r.headers, "the Server header is the adapter's, and the adapter sends none")
 
     # --- the event --------------------------------------------------------------------------------
 
@@ -258,10 +259,22 @@ class Contract:
         s.close()
         self.assertEqual(request(p.port, "GET", "/string").status, 200)
 
+    def test_a_question_mark_after_the_first_belongs_to_the_first_name(self):
+        p = self.serve()
+        self.assertEqual(request(p.port, "GET", "/echo??x=1").json()["event"]["query"], {"?x": "1"})
+
+    def test_a_content_length_of_thousands_of_digits_is_refused_not_dropped(self):
+        p = self.serve()
+        s = socket.create_connection(("127.0.0.1", p.port), timeout=10)
+        s.sendall(b"POST /len HTTP/1.1\r\nHost: x\r\nContent-Length: " + b"1" * 5000 + b"\r\n\r\n")
+        self.assertRegex(s.recv(4096), rb"^HTTP/1\.1 4(00|13) ")
+        s.close()
+        self.assertEqual(request(p.port, "GET", "/string").status, 200)
+
     def test_the_query_keeps_odd_names_and_odd_escapes(self):
         p = self.serve()
-        got = request(p.port, "GET", "/echo?constructor=1&toString=2&__proto__=3&a=1;b=2&c=%zz&d=a+b").json()["event"]["query"]
-        self.assertEqual(got, {"constructor": "1", "toString": "2", "__proto__": "3", "a": "1;b=2", "c": "%zz", "d": "a b"})
+        got = request(p.port, "GET", "/echo?constructor=1&toString=2&__proto__=3&a=1;b=2&c=%zz&d=a+b&e=%zz%41&f=%zz+c").json()["event"]["query"]
+        self.assertEqual(got, {"constructor": "1", "toString": "2", "__proto__": "3", "a": "1;b=2", "c": "%zz", "d": "a b", "e": "%zzA", "f": "%zz c"})
 
     def test_a_utf8_body_keeps_its_byte_order_mark(self):
         p = self.serve()
@@ -351,11 +364,16 @@ class Contract:
         self.assertIsNone(a["remainingMs"], "without TITAN_TIMEOUT_SECONDS there is no deadline to report")
 
     def test_a_timeout_that_is_not_a_positive_number_means_no_deadline(self):
-        for value in ("0", "-5", "abc", "inf", "nan", ""):
+        for value in ("0", "-5", "abc", "inf", "nan", "", " 5 ", "5_0", "0x10", "1e10", "1e308"):
             p = self.serve(TITAN_TIMEOUT_SECONDS=value)
             self.assertIsNone(request(p.port, "GET", "/echo").json()["context"]["remainingMs"], value)
             p.proc.send_signal(signal.SIGTERM)
             p.wait(5)
+
+    def test_a_very_long_timeout_is_a_long_deadline_not_an_error(self):
+        p = self.serve(TITAN_TIMEOUT_SECONDS="9" * 30)
+        left = request(p.port, "GET", "/echo").json()["context"]["remainingMs"]
+        self.assertTrue(10**11 < left <= 10**12, left)
 
     def test_the_time_left_runs_down_while_the_function_runs(self):
         p = self.serve(TITAN_TIMEOUT_SECONDS="10")
@@ -379,6 +397,17 @@ class Contract:
         self.assertEqual(sorted(event), ["schedule", "scheduledTime", "trigger"])
         self.assertFalse(p.listening(), "a cron run opens no port")
 
+    def test_a_method_the_adapter_has_never_heard_of_reaches_the_function(self):
+        p = self.serve()
+        s = socket.create_connection(("127.0.0.1", p.port), timeout=10)
+        s.sendall(b"PROPFIND /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        raw = b""
+        while chunk := s.recv(4096):
+            raw += chunk
+        s.close()
+        self.assertTrue(raw.startswith(b"HTTP/1.1 200"), raw)
+        self.assertEqual(json.loads(raw.split(b"\r\n\r\n", 1)[1])["event"]["method"], "PROPFIND")
+
     def test_cron_does_not_read_the_port(self):
         p = self.cron(PORT="abc")
         self.assertEqual(p.wait(15), 0, p.stderr())
@@ -390,6 +419,11 @@ class Contract:
         after = time.strftime("%Y-%m-%dT%H:%M:00Z", time.gmtime())
         event = json.loads(p.stdout().split("CRON-EVENT ", 1)[1])
         self.assertIn(event["scheduledTime"], (before, after))
+
+    def test_cron_output_is_not_cut_when_the_process_ends(self):
+        p = self.cron(FIXTURE_CRON="bigout")
+        self.assertEqual(p.wait(15), 0, p.stderr())
+        self.assertGreaterEqual(len(p.stdout()), 1_048_576)
 
     def test_cron_exits_1_with_the_stack_on_stderr_when_the_function_throws(self):
         p = self.cron(FIXTURE_CRON="fail")
@@ -414,6 +448,19 @@ class Contract:
         p.proc.send_signal(signal.SIGTERM)
         t.join(10)
         self.assertEqual((out["r"].status, out["r"].body), (200, b"slept"))
+        self.assertEqual(p.wait(5), 0, p.stderr())
+
+    def test_sigterm_lets_a_large_response_reach_a_slow_reader(self):
+        p = self.serve()
+        s = socket.create_connection(("127.0.0.1", p.port), timeout=15)
+        s.sendall(b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        time.sleep(0.5)  # the kernel buffers fill; the adapter is still writing
+        p.proc.send_signal(signal.SIGTERM)
+        raw = b""
+        while chunk := s.recv(1 << 16):
+            raw += chunk
+        s.close()
+        self.assertEqual(len(raw.split(b"\r\n\r\n", 1)[1]), 8_000_000)
         self.assertEqual(p.wait(5), 0, p.stderr())
 
     def test_sigterm_does_not_wait_for_a_long_request(self):
@@ -466,6 +513,23 @@ class Contract:
 class DynamicLoadContract(Contract):
     """Load failures only a dynamic language has: Go links its handler at build time."""
 
+    def test_an_empty_function_dir_is_the_default_one(self):
+        # the default is /function, which does not exist here: an empty value must not mean "the current directory"
+        self.assert_does_not_start(TITAN_FUNCTION_DIR="")
+
+    def test_sigterm_during_a_slow_import_exits_143(self):
+        slow = os.path.join(FIXTURES, self.runtime + "-slow")
+        for trigger in ("http", "cron"):
+            p = self.start(TITAN_TRIGGER=trigger, TITAN_FUNCTION_DIR=slow)
+            time.sleep(0.5)
+            t0 = time.time()
+            p.proc.send_signal(signal.SIGTERM)
+            code = p.wait(6)
+            # Node.js deals with a signal that came in while a synchronous import blocked it only after that import: an HTTP
+            # adapter is by then listening (0), a cron run may have finished (0). Either way the process ends at once
+            self.assertIn(code, (0, 143), trigger + ": " + p.stderr())
+            self.assertLess(time.time() - t0, 3.5, trigger)
+
     def test_a_missing_module_does_not_start(self):
         self.assert_does_not_start(TITAN_HANDLER="nomodule.handler")
 
@@ -516,6 +580,11 @@ class PythonContract(DynamicLoadContract, unittest.TestCase):
 class NodeContract(DynamicLoadContract, unittest.TestCase):
     runtime = "node"
 
+    def test_cron_survives_a_promise_left_unhandled(self):
+        p = self.cron(FIXTURE_CRON="dangling")
+        self.assertEqual(p.wait(15), 0, p.stderr())
+        self.assertIn("dangling", p.stderr())
+
     def test_a_promise_left_unhandled_does_not_end_the_adapter(self):
         p = self.serve()
         self.assertEqual(request(p.port, "GET", "/dangling").body, b"ok")
@@ -535,10 +604,19 @@ class GoContract(Contract, unittest.TestCase):
     def setUpClass(cls):
         cls.bin_dir = tempfile.mkdtemp(prefix="titan-contract-go-")
         cls.addClassCleanup(shutil.rmtree, cls.bin_dir, True)
-        out = subprocess.run(["go", "build", "-o", os.path.join(cls.bin_dir, "bootstrap"), "./tests/contract/fixtures/go"],
-                             cwd=ROOT, env={**os.environ, "CGO_ENABLED": "0"}, capture_output=True, text=True)
-        if out.returncode != 0:
-            raise RuntimeError("go build of the fixture failed: " + out.stderr)
+        for name, package in (("bootstrap", "go"), ("slow", "go-slow")):
+            out = subprocess.run(["go", "build", "-o", os.path.join(cls.bin_dir, name), f"./tests/contract/fixtures/{package}"],
+                                 cwd=ROOT, env={**os.environ, "CGO_ENABLED": "0"}, capture_output=True, text=True)
+            if out.returncode != 0:
+                raise RuntimeError("go build of the fixture failed: " + out.stderr)
+
+    def test_sigterm_during_the_programs_own_initialisation_exits_143(self):
+        for trigger in ("http", "cron"):
+            p = Process([os.path.join(self.bin_dir, "slow")], {"TITAN_TRIGGER": trigger}, cwd=ROOT)
+            self.addCleanup(p.kill)
+            time.sleep(0.5)
+            p.proc.send_signal(signal.SIGTERM)
+            self.assertEqual(p.wait(6), 143, trigger + ": " + p.stderr())
 
     def argv(self):
         return [os.path.join(self.bin_dir, "bootstrap")]

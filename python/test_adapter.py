@@ -62,6 +62,12 @@ class ToResponse(unittest.TestCase):
             with self.assertRaises(adapter.InvalidResponse, msg=repr(bad)):
                 adapter.to_response(bad)
 
+    def test_an_int_subclass_is_a_status_but_a_bool_is_not(self):
+        import http
+        self.assertEqual(adapter.to_response({"statusCode": http.HTTPStatus.OK})[0], 200)
+        with self.assertRaises(adapter.InvalidResponse):
+            adapter.to_response({"statusCode": True})
+
     def test_a_coroutine_is_refused_and_closed(self):
         async def handler():
             return "x"

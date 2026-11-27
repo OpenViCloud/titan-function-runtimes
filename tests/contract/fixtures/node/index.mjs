@@ -25,7 +25,12 @@ export async function handler(event, context) {
     console.log('CRON-EVENT ' + JSON.stringify(event));
     const mode = process.env.FIXTURE_CRON ?? '';
     if (mode === 'fail') throw new Error('cron-boom');
+    if (mode === 'bigout') console.log('x'.repeat(1048576));
     if (mode === 'sleep') await sleep(30000);
+    if (mode === 'dangling') {
+      Promise.reject(new Error('dangling'));
+      await sleep(300);
+    }
     return undefined;
   }
   const { path, query } = event;
@@ -46,9 +51,11 @@ export async function handler(event, context) {
     case '/crlf':
       return { statusCode: 200, headers: { 'x-a': 'b\r\nx-evil: 1' }, body: 'x' };
     case '/framing':
-      return { statusCode: 200, headers: { 'Content-Length': '1', Connection: 'close', 'X-Ok': '1' }, body: 'hello' };
+      return { statusCode: 200, headers: { 'Content-Length': '1', Connection: 'close', Server: 'evil', 'X-Ok': '1' }, body: 'hello' };
     case '/b64':
       return { statusCode: 200, isBase64Encoded: true, body: Buffer.from([0, 255, 65, 66]).toString('base64') };
+    case '/big':
+      return 'a'.repeat(8000000);
     case '/dangling':
       Promise.reject(new Error('dangling'));
       return 'ok';

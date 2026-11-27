@@ -5,7 +5,8 @@
   - every image runs as user 1000 and starts one entrypoint, the adapter (Go: the customer's bootstrap);
   - the package a runtime is published as names the version its base image has (python3.15 <-> python:3.15-slim);
   - the push builds one single-platform manifest (`provenance: false`): the composer in the function cluster refuses an index;
-  - the workflow pushes only from main.
+  - the workflow pushes only from main, once the tests and the image builds passed, and only the push job can write packages;
+  - the workflow runs on pull_request (never pull_request_target) and on pushes to main, and can only read by default.
 
 Run:  python3 scripts/test_images.py
 """
@@ -52,7 +53,7 @@ class Images(unittest.TestCase):
     def jobs(self):
         ci = read(".github", "workflows", "ci.yml")
         text = ci[ci.index("\njobs:"):]
-        parts = re.split(r"\n  (?=[a-z]+:\n    name:)", text)[1:]
+        parts = re.split(r"\n  (?=[A-Za-z0-9_-]+:\n    name:)", text)[1:]
         return {p.split(":", 1)[0]: p for p in parts}
 
     def test_the_push_is_one_manifest_and_only_from_main(self):
@@ -63,6 +64,21 @@ class Images(unittest.TestCase):
         self.assertIn("platforms: linux/amd64", push)
         self.assertIn("if: github.event_name == 'push' && github.ref == 'refs/heads/main'", push)
         self.assertIn("push: true", push)
+
+    def test_the_workflow_runs_on_pull_requests_and_pushes_to_main_only(self):
+        ci = read(".github", "workflows", "ci.yml")
+        on = ci[ci.index("\non:"):ci.index("\npermissions:")]
+        self.assertNotIn("pull_request_target", on)
+        self.assertRegex(on, r"push:\s+branches: \[main\]")
+        self.assertRegex(on, r"pull_request:\s+branches: \[main\]")
+
+    def test_the_workflow_by_default_can_only_read(self):
+        ci = read(".github", "workflows", "ci.yml")
+        top = ci[ci.index("\npermissions:"):ci.index("\njobs:")]
+        self.assertEqual(re.findall(r"^  (\S+): (\S+)$", top, re.M), [("contents", "read")])
+
+    def test_the_push_waits_for_the_tests_and_the_image_builds(self):
+        self.assertRegex(self.jobs()["push"], r"needs: \[test, image\]")
 
     def test_only_the_push_job_can_write_packages_or_push(self):
         for name, job in self.jobs().items():

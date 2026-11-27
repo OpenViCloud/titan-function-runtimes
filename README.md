@@ -18,8 +18,9 @@ repository, sets that): `/function` holds the customer's code and is read-only, 
 ## The contract
 
 The same for every runtime, with the differences named. `tests/contract/contract_test.py` runs its cases against all three; the
-cases that need a handler of the wrong shape (a dynamic language can return one, a typed Go handler cannot) and the ones about
-loading a module (Go links its handler at build time) run against Python and Node.js only.
+cases that need a handler of the wrong shape (a dynamic language can return one, a typed Go handler cannot), the ones about
+loading a module (Go links its handler at build time), `sys.exit` in a handler (Python) and a promise left unhandled (Node.js) run
+against the languages they apply to only.
 
 **HTTP** (`TITAN_TRIGGER=http`, the default): the adapter listens on `$PORT` and turns a request into an `event` and the
 return value into the response.
@@ -53,10 +54,10 @@ carries on. A panic in a goroutine of a Go function ends the process (Go gives n
 
 **Cron** (`TITAN_TRIGGER=cron`): the adapter calls the function once with `{trigger: "cron", schedule, scheduledTime}`, ignores
 the result, does not read `PORT` and opens no port. It exits 0 when the function returned, and non-zero when it threw or was
-not a valid function: 1, with the stack on stderr (Node.js exits 13 when the function's promise never settles).
+not a valid function: 1, with the stack on stderr (Node.js exits 13 when the function's promise never settles and nothing else keeps it running).
 
 **Stopping**: the adapter is PID 1 in the pod. On SIGTERM it stops accepting, lets requests in flight finish for up to 2 s and
-exits 0; a cron run in progress exits 143, and so does a SIGTERM during start-up. A function that does not load (no module, no
+exits 0; a cron run in progress exits 143. A SIGTERM while the function's module is still loading (a Go program: its own initialisation, which runs after this library's) ends the process at once: 143, or 0 when the module finished loading first and the adapter was already listening (HTTP) or the run had finished (cron). A function that does not load (no module, no
 handler, `PORT` not plain digits) exits 1 at start.
 
 **Environment** the function service sets (the `TITAN_` prefix is reserved; an empty value is the same as unset):

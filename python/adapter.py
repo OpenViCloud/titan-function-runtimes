@@ -10,7 +10,6 @@ import base64
 import http.server
 import importlib
 import inspect
-import math
 import os
 import re
 import signal
@@ -24,6 +23,7 @@ import uuid
 
 MAX_BODY = 6 * 1024 * 1024
 SHUTDOWN_WAIT = 2.0
+MAX_TIMEOUT = 1e9  # seconds; a longer timeout is this long
 FRAMING_HEADERS = {"content-length", "transfer-encoding", "connection", "server"}
 HEADER_VALUE = re.compile(r"[\t\x20-\x7e]*")  # visible ASCII: what every runtime sends as a header value
 CHUNK_SIZE = re.compile(r"[0-9a-fA-F]{1,8}")
@@ -75,11 +75,11 @@ def _context(headers, timeout):
 
 def _timeout():
     """TITAN_TIMEOUT_SECONDS as a number of seconds; anything but a positive finite number means no deadline."""
-    try:
-        seconds = float(os.environ.get("TITAN_TIMEOUT_SECONDS", ""))
-    except ValueError:
+    raw = os.environ.get("TITAN_TIMEOUT_SECONDS", "")
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", raw):  # plain decimals only: float() also takes " 5 ", "5_0", "inf"
         return None
-    return seconds if math.isfinite(seconds) and seconds > 0 else None
+    seconds = min(float(raw), MAX_TIMEOUT)
+    return seconds if seconds > 0 else None
 
 
 def split_target(target):
@@ -99,7 +99,7 @@ def to_response(result):
     if not isinstance(result, dict):
         raise InvalidResponse(f"the function returned {type(result).__name__}, not a string or a dict with statusCode")
     status = result.get("statusCode")
-    if type(status) is not int or not 200 <= status <= 599:
+    if not isinstance(status, int) or isinstance(status, bool) or not 200 <= status <= 599:
         raise InvalidResponse(f"statusCode {status!r} is not an integer from 200 to 599")
     headers = result.get("headers", {})
     if headers is None:
@@ -178,10 +178,9 @@ class Server(http.server.ThreadingHTTPServer):
                 self.server_bind()
                 self.server_activate()
                 return
-            except OSError:
+            except OSError:  # a port in use is an error whatever the family
                 self.socket.close()
-                if family == socket.AF_INET:
-                    raise
+                raise
 
 
 class RequestHandler(http.server.BaseHTTPRequestHandler):
@@ -204,8 +203,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     raise BadRequest()
                 size = int(digits, 16)
                 if size == 0:
-                    while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
-                        pass
+                    for _ in range(64):  # trailers: read, ignore, and not without end
+                        if self.rfile.readline(1024) in (b"\r\n", b"\n", b""):
+                            break
                     return bytes(data)
                 if len(data) + size > MAX_BODY:
                     self._too_large()
@@ -215,7 +215,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         raw = self.headers.get("Content-Length") or "0"
         if not (raw.isascii() and raw.isdigit()):
             raise BadRequest()
-        length = int(raw)
+        length = int(raw) if len(raw) <= 12 else MAX_BODY + 1  # int() of thousands of digits raises
         if length > MAX_BODY:
             self._too_large()
             return None
@@ -263,7 +263,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             try:
                 body = self._read_body()
             except BadRequest:
-                self._send(400, [("Content-Type", "text/plain; charset=utf-8")], b"Bad Request", close=True)
+                try:
+                    self._send(400, [("Content-Type", "text/plain; charset=utf-8")], b"Bad Request", close=True)
+                except OSError:  # the client has gone
+                    self.close_connection = True
                 return
             if body is None:
                 return
@@ -293,7 +296,10 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         finally:
             self.server.inflight.leave()
 
-    do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _serve
+    def __getattr__(self, name):
+        if name.startswith("do_"):  # any method, as the other runtimes: the function sees PROPFIND and PURGE too
+            return self._serve
+        raise AttributeError(name)
 
 
 def run_http(handler):
@@ -347,7 +353,7 @@ def main():
     if trigger not in ("http", "cron"):
         sys.exit(f"TITAN_TRIGGER {trigger!r} is neither http nor cron")
     try:
-        handler = load_handler(os.environ.get("TITAN_HANDLER", ""), os.environ.get("TITAN_FUNCTION_DIR", "/function"))
+        handler = load_handler(os.environ.get("TITAN_HANDLER", ""), os.environ.get("TITAN_FUNCTION_DIR") or "/function")
     except BaseException:
         traceback.print_exc()
         sys.exit(1)
