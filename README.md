@@ -29,9 +29,11 @@ return value into the response.
 event    {trigger: "http", method, path, query, headers, body, isBase64Encoded}
            path: the path of the request target without the query, not decoded; an absolute-form target loses its scheme and
                  host, and a leading run of slashes is one
-           method: as sent (Node.js answers 400 itself to a method its HTTP parser does not know)
+           method: as the runtime's HTTP parser delivers it; one the parser rejects is answered 400 without calling the function
+                   (Node.js: lower-case or unknown methods; Go: a method that is not an HTTP token)
            query: {name: "a,b"}: split on "&" only, a malformed escape stays as written, a repeated name is joined by ",";
-                  bytes that are not UTF-8 become U+FFFD (how many of them for a cut-off multi-byte sequence differs)
+                  percent-escaped bytes that are not UTF-8 become U+FFFD (how many of them for a cut-off multi-byte sequence
+                  differs); raw non-ASCII bytes in the target are not valid HTTP and are not specified
            headers: lower-case names; a repeated header is joined by ", "
            body: a string if it is UTF-8 (a leading byte order mark stays), else base64 with isBase64Encoded true;
                  a body over 6 MiB is answered 413 and the function is not called

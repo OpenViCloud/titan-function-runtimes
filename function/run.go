@@ -32,7 +32,8 @@ const (
 
 var plainDecimal = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
 
-// started is true once Start has its own SIGTERM channel: from then on a signal is Start's, buffered until its loop reads it. Before that (the program's initialisation, which runs
+// started is true once Start has its own SIGTERM channel: from then on a signal is Start's,
+// buffered until its loop reads it. Before that (the program's initialisation, which runs
 // after this package's init) a SIGTERM would be ignored by a process that is PID 1: end it, as the other adapters do.
 var started atomic.Bool
 
@@ -253,7 +254,8 @@ func unescape(s string) string {
 	return b.String()
 }
 
-// validUTF8 turns each byte that is not valid UTF-8 into U+FFFD, as the Python and Node.js adapters decode it.
+// validUTF8 turns each byte that is not valid UTF-8 into U+FFFD, as the Python and Node.js adapters decode it, except that a
+// cut-off multi-byte sequence is one U+FFFD there and one per byte here.
 func validUTF8(s string) string {
 	if utf8.ValidString(s) {
 		return s

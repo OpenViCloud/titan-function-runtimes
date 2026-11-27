@@ -116,9 +116,10 @@ class Listening(unittest.TestCase):
 
 class PortInUse(unittest.TestCase):
     def test_a_port_that_is_taken_is_an_error_not_a_reason_to_try_another_family(self):
+        # v6-only: a dual-stack holder would make the IPv4 attempt fail too, and the test would pass with a fallback in the code
         holder = socket.socket(socket.AF_INET6)
         self.addCleanup(holder.close)
-        holder.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        holder.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         holder.bind(("::", 0))
         holder.listen()
         with self.assertRaises(OSError):

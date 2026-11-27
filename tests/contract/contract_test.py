@@ -335,6 +335,22 @@ class Contract:
         self.assertEqual(request(p.port, "GET", "/string").status, 200)
         self.assertNotIn("LEN-CALLED", p.stdout())
 
+    def test_a_chunked_request_with_many_trailers_does_not_poison_the_connection(self):
+        p = self.serve()
+        s = socket.create_connection(("127.0.0.1", p.port), timeout=5)
+        trailers = "".join(f"X-T{i}: v\r\n" for i in range(70))
+        s.sendall(("POST /len HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n" + trailers +
+                   "\r\nGET /string HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").encode())
+        raw = b""
+        try:
+            while chunk := s.recv(4096):
+                raw += chunk
+        except socket.timeout:
+            pass
+        s.close()
+        self.assertTrue(raw.startswith(b"HTTP/1.1 200"), raw)
+        self.assertNotIn(b"HTTP/1.1 400", raw, "what follows the trailers is a request, or nothing, never garbage parsed as one")
+
     def test_a_malformed_request_is_400_and_the_adapter_lives_on(self):
         p = self.serve()
         for head in ("Content-Length: abc", "Content-Length: -5", "Content-Length: \u00b2",
@@ -374,16 +390,23 @@ class Contract:
         self.assertIsNone(a["remainingMs"], "without TITAN_TIMEOUT_SECONDS there is no deadline to report")
 
     def test_a_timeout_that_is_not_a_plain_decimal_means_no_deadline(self):
-        for value in ("0", "-5", "abc", "inf", "nan", "", " 5 ", "5_0", "0x10", "1e10", "1e308"):
+        for value in ("0", "-5", "abc", "inf", "nan", "", " 5 ", "5_0", "0x10", "1e10", "1e308", ".5", "5.", "+5"):
             p = self.serve(TITAN_TIMEOUT_SECONDS=value)
             self.assertIsNone(request(p.port, "GET", "/echo").json()["context"]["remainingMs"], value)
             p.proc.send_signal(signal.SIGTERM)
             p.wait(5)
 
     def test_a_very_long_timeout_is_a_long_deadline_not_an_error(self):
-        p = self.serve(TITAN_TIMEOUT_SECONDS="9" * 30)
-        left = request(p.port, "GET", "/echo").json()["context"]["remainingMs"]
-        self.assertTrue(10**11 < left <= 10**12, left)
+        for digits in (30, 400):  # 400 digits is beyond float64
+            p = self.serve(TITAN_TIMEOUT_SECONDS="9" * digits)
+            left = request(p.port, "GET", "/echo").json()["context"]["remainingMs"]
+            self.assertTrue(10**11 < left <= 10**12, (digits, left))
+            p.proc.send_signal(signal.SIGTERM)
+            p.wait(5)
+
+    def test_a_timeout_below_a_nanosecond_is_a_deadline_that_has_passed(self):
+        p = self.serve(TITAN_TIMEOUT_SECONDS="0.0000000001")
+        self.assertEqual(request(p.port, "GET", "/echo").json()["context"]["remainingMs"], 0)
 
     def test_the_time_left_runs_down_while_the_function_runs(self):
         p = self.serve(TITAN_TIMEOUT_SECONDS="10")

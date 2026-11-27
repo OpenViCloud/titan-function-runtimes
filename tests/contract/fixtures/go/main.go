@@ -21,7 +21,7 @@ func remaining(ctx context.Context) any {
 	if !ok {
 		return nil
 	}
-	return time.Until(d).Milliseconds()
+	return max(time.Until(d).Milliseconds(), 0)
 }
 
 func reply(v any) function.Response {

@@ -32,6 +32,12 @@ func TestConfigFrom(t *testing.T) {
 			t.Errorf("TITAN_TIMEOUT_SECONDS=%q means no deadline, got %v", v, c.timeout)
 		}
 	}
+	// a number beyond float64 and one below a nanosecond are still deadlines: the other runtimes say so
+	for v, atLeast := range map[string]time.Duration{strings.Repeat("9", 400): 1e9 * time.Second, "0.0000000001": 1} {
+		if c, _ := configFrom(env(map[string]string{"TITAN_TIMEOUT_SECONDS": v}), now); c.timeout != atLeast {
+			t.Errorf("TITAN_TIMEOUT_SECONDS=%.12s... gave %v, want %v", v, c.timeout, atLeast)
+		}
+	}
 	if _, err := configFrom(env(map[string]string{"TITAN_TRIGGER": "cron", "PORT": "abc"}), now); err != nil {
 		t.Errorf("a cron run does not read PORT: %v", err)
 	}
